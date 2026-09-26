@@ -2,6 +2,7 @@
 """Exercise request bounds, codecs and the native layer's disconnect behavior."""
 import contextlib
 import ctypes
+import sys
 import io
 import pathlib
 import socket
@@ -14,6 +15,8 @@ import numpy as np
 import nr_daemon as daemon
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+import nr_build  # noqa: E402
 
 
 class Request:
@@ -87,10 +90,22 @@ def resample_tests():
     block = np.arange(4 * 6 * 1, dtype=np.float32).reshape(4, 6, 1)
     assert np.allclose(daemon.resample(block, (2, 3)),
                        block.reshape(2, 2, 3, 2, 1).mean((1, 3))), "area mean"
+    # and it is NumPy's own mean to the bit, not merely close: the explicit adds follow
+    # its order, one sample at a time in row-major order, then a division by the count
+    for (height, width), (new_height, new_width) in (((360, 640), (180, 320)),
+                                                     ((90, 160), (30, 80)),
+                                                     ((96, 128), (24, 32))):
+        for scale in (1.0, 1e-3, 255.0):
+            frame = (rng.random((height, width, 3)) * scale).astype(np.float32)
+            want = frame.reshape(new_height, height // new_height, new_width,
+                                 width // new_width, -1).mean((1, 3)).astype(np.float32)
+            got = daemon.resample(frame, (new_height, new_width))
+            assert got.dtype == np.float32 and np.array_equal(
+                got.view(np.uint32), want.view(np.uint32)), ((height, width), scale)
     flat = np.full((8, 8, 3), 0.25, np.float32)
     assert np.allclose(daemon.resample(flat, (19, 5)), 0.25), "a constant must stay constant"
     print("resample: separable form matches the two-dimensional one, area-averages on a\n"
-          "  whole factor, and leaves a constant alone")
+          "  whole factor byte-identically to NumPy's mean, and leaves a constant alone")
 
 
 def letterbox_tests():
@@ -179,7 +194,7 @@ def native_exchange_tests():
 
                 thread = threading.Thread(target=serve)
                 thread.start()
-                result = subprocess.run([str(ROOT / 'work' / 'test_exchange'), path,
+                result = subprocess.run([str(nr_build.executable('test_exchange')), path,
                                          mode if mode in ('echo', 'masked') else 'reject'],
                                         capture_output=True, timeout=10)
                 thread.join(timeout=6)
@@ -197,7 +212,7 @@ def device_lost_tests():
     """
     import xmxres
     assert daemon.DeviceLost is xmxres.DeviceLost
-    library = ctypes.CDLL(str(ROOT / 'work' / 'libxmx.so'))
+    library = ctypes.CDLL(str(nr_build.library('xmx')))
     assert library.xmx_device_lost() == 0, "a device nobody has lost is not lost"
     message = lambda: b'resident submit (-4)'
     lost = xmxres.failure(SimpleNamespace(xmx_error=message, xmx_device_lost=lambda: 1),

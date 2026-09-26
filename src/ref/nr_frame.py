@@ -53,16 +53,47 @@ def load_mlx_numpy_modules(names=MLX_NUMPY_MODULES):
         key = f"mlxnp.{name}"
         module = sys.modules.get(key)
         if module is None:
-            spec = importlib.util.spec_from_file_location(key, _MLX / f"{name}.py")
+            path = _MLX / f"{name}.py"
+            spec = importlib.util.spec_from_file_location(key, path)
             module = importlib.util.module_from_spec(spec)
             sys.modules[key] = module
-            spec.loader.exec_module(module)
+            if sys.version_info < (3, 10):
+                # `motion_quality.py` writes `np.ndarray | None` in a dataclass body, which
+                # Python evaluates when the class is built and 3.9 cannot (`|` on types
+                # arrived in 3.10). Compiling the source under postponed evaluation turns
+                # every annotation into a string and changes nothing else about the
+                # module. macOS ships 3.9; the temporal path should not need a second
+                # interpreter for one line of type syntax.
+                import __future__
+                code = compile(path.read_text(), str(path), "exec",
+                               flags=__future__.annotations.compiler_flag, dont_inherit=True)
+                exec(code, module.__dict__)
+            else:
+                spec.loader.exec_module(module)
         loaded.append(module)
     return loaded
 
 
 features_mod, composition_mod = load_mlx_numpy_modules(("features", "composition"))
 NetworkGeometry = features_mod.NetworkGeometry
+
+# The network's frame is padded, by mirroring, to at least this on a side and to a multiple
+# of 64. 320 is what NVIDIA's own driver does (`NetworkGeometry.vendor_aligned`); the graph
+# itself runs down to 128 — a window of 8 at a sixteenth of the extent, MLX-DLSS's graph
+# contract. At a small live size most of a 320x320 frame is mirror padding: 44 % of it for a
+# 320x180 frame, 82 % for 179x101.
+VENDOR_MINIMUM_EXTENT = 320
+GRAPH_MINIMUM_EXTENT = 128
+
+
+def network_geometry(width, height, minimum=VENDOR_MINIMUM_EXTENT):
+    """The network extent for a `width` x `height` frame: at least `minimum` a side (never
+    below the graph's 128), rounded up to 64. At 320 it is `NetworkGeometry.vendor_aligned`."""
+    floor = max(GRAPH_MINIMUM_EXTENT, int(minimum))
+
+    def aligned(extent):
+        return -(-max(floor, extent) // 64) * 64
+    return NetworkGeometry(width, height, aligned(width), aligned(height))
 # The three noise channels depend on the extent and the frame index and on nothing else,
 # and both callers copy the result into a slice rather than writing through it. In a live
 # mode the frame index does not move — the daemon never sets one — so the same array was
@@ -107,7 +138,7 @@ BLEND_SCALE = 0.73974609375
 
 def build_features(colour, *, geometry, history=None, frame_index=0,
                    normalized_style=0.0, local_tone_strength=1.0,
-                   local_structure_strength=1.0):
+                   local_structure_strength=1.0, out=None):
     """`make_features` with the history folded in, natively where that is available.
 
     The two steps are one pass in C: the mirror onto the network extent, the three FP16
@@ -117,6 +148,9 @@ def build_features(colour, *, geometry, history=None, frame_index=0,
 
     Only the plain recipe goes native — no control mask and no automatic mask — which is
     the one a game uses; anything else falls back and is bit-identical either way.
+
+    `out`, when given, is where the features are written — the graph's own mapped input
+    (`ResidentBackend.input_view`), float32 or half — and is returned.
     """
     values = dict(normalized_style=normalized_style,
                   local_tone_strength=local_tone_strength,
@@ -129,12 +163,16 @@ def build_features(colour, *, geometry, history=None, frame_index=0,
             colour, geometry.source_rows(), geometry.source_columns(),
             deterministic_noise(geometry.network_height, geometry.network_width,
                                 frame_index),
-            controls, history=history)
+            controls, history=history, out=out)
     if native is not None:
         return native
     features = make_features(colour, geometry=geometry, frame_index=frame_index, **values)
     if history is not None:
         apply_history(features, history, geometry)
+    if out is not None:
+        # NumPy's half rounding is the GPU's to_half, to the bit (test_input_fp16.py)
+        np.copyto(out, features, casting="unsafe")
+        return out
     return features
 
 
@@ -166,9 +204,78 @@ def apply_history(features, history, geometry=None):
 
 
 def history_weight(head, *, blend_scale=BLEND_SCALE):
-    """The per-pixel history weight the model asked for, from head channel 4."""
-    logit = half(np.asarray(head, dtype=np.float32)[..., 3:4])
+    """The per-pixel history weight the model asked for, from head channel 4.
+
+    The logit is rounded to half before anything else, so the gate has 65536 possible
+    inputs. NumPy's own expression — `gate_formula`, below — is evaluated once on every one
+    of them, and each frame indexes that table: the same expression on the same values, so
+    bit-identical, where it used to run an exp, a reciprocal and a clip on every pixel of
+    the output. 3.1 ms of a 1280x720 frame. `test_nr_model.py` checks the table against the
+    formula on all 65536 inputs.
+    """
+    bits = np.asarray(head, dtype=np.float32)[..., 3:4].astype(np.float16).view(np.uint16)
+    return gate_table(float(blend_scale))[bits]
+
+
+def gate_formula(logit, blend_scale=BLEND_SCALE):
+    """The gate as the model defines it, on a logit already rounded to half."""
     return np.clip(1.0 / (1.0 + np.exp(-logit)) * half(blend_scale), 0, 1)
+
+
+HOLD_RAMP = np.float32(4.0)
+
+
+def release_slope(levels):
+    """The folded constant of the release: the gate's share falls from all of it at no
+    change to none by `levels` of 255. 0 turns it off."""
+    return float(np.float32(-255.0 / levels)) if levels > 0 else 0.0
+
+
+def release_factor(current, previous, slope):
+    """How much of the model's gate a pixel keeps, from what the game did to it: the
+    largest step of its three channels, `clip(1 + moved * slope, 0, 1)` in the order the
+    native composition computes it."""
+    moved = np.abs(np.subtract(current[..., 0], previous[..., 0], dtype=np.float32))
+    scratch = np.empty_like(moved)
+    for channel in (1, 2):
+        np.subtract(current[..., channel], previous[..., channel], out=scratch)
+        np.maximum(moved, np.abs(scratch, out=scratch), out=moved)
+    np.multiply(moved, np.float32(slope), out=moved)
+    np.add(moved, np.float32(1.0), out=moved)
+    return np.clip(moved, 0, 1, out=moved)[..., None]
+
+
+def hold_floor(current, previous, strength):
+    """Per-pixel lower bound on the history weight, from what the *game* did: full where
+    the game handed back the same pixel, gone by `HOLD_RAMP` levels of 255 (notes/phase54).
+
+    Channel by channel and in place — the obvious `max(abs(a - b), axis=2)` builds two
+    temporaries and runs seven full-frame passes at the output resolution — and folded
+    into one multiply-add-clip, which is the order the native composition transcribes.
+    """
+    floor = np.abs(np.subtract(current[..., 0], previous[..., 0], dtype=np.float32))
+    scratch = np.empty_like(floor)
+    for channel in (1, 2):
+        np.subtract(current[..., channel], previous[..., channel], out=scratch)
+        np.maximum(floor, np.abs(scratch, out=scratch), out=floor)
+    # clip(1 - moved * 255 / ramp, 0, 1) * strength, folded into one multiply-add-clip
+    np.multiply(floor, np.float32(-255.0 * strength / HOLD_RAMP), out=floor)
+    np.add(floor, np.float32(strength), out=floor)
+    return np.clip(floor, 0, strength, out=floor)[..., None]
+
+
+_GATE_TABLES = {}
+
+
+def gate_table(blend_scale):
+    """`gate_formula` on every half value, indexed by the value's sixteen bits."""
+    table = _GATE_TABLES.get(blend_scale)
+    if table is None:
+        every = np.arange(1 << 16, dtype=np.uint32).astype(np.uint16).view(np.float16)
+        with np.errstate(over="ignore", invalid="ignore"):
+            table = gate_formula(every.astype(np.float32), blend_scale).astype(np.float32)
+        _GATE_TABLES[blend_scale] = table
+    return table
 
 
 # What the vendor's own panel starts at, which is not what MLX-DLSS's profiles use:
@@ -248,6 +355,11 @@ class ResidentBackend:
             self.device_weights.close()
             self.device_weights = None
 
+    def input_view(self, height, width):
+        """The mapped input of the frame at this extent, to build the features in: then
+        `run_features` has nothing to copy."""
+        return self.frame(height, width).input_view()
+
     def run_features(self, features):
         height, width = features.shape[:2]
         frame = self.frame(height, width)
@@ -293,7 +405,8 @@ def run_head(model, color, *, profile="standard", frame_index=0, style_index=Non
 
 def compose(head, color, *, intensity=1.0, detail_strength=1.0, colour_strength=1.0,
             detail_radius=4.0, control_mask=None, history=None,
-            history_confidence=1.0, history_floor=None, blend_scale=BLEND_SCALE):
+            history_confidence=1.0, history_floor=None, history_previous=None,
+            history_hold=0.0, history_release=0.0, blend_scale=BLEND_SCALE):
     """The head over the frame. Post-network and cheap: sweep it without re-running.
 
     With a `history` image this is MLX-DLSS's `compose_temporal` instead of its
@@ -313,6 +426,13 @@ def compose(head, color, *, intensity=1.0, detail_strength=1.0, colour_strength=
     that can prove the history is correct for a pixel — because the game handed back the
     same bytes — can say so here. The floor is still bounded by `blend_scale`, so no
     pixel is held harder than the model itself ever holds one.
+
+    `history_release` is the other half of the same signal: where the game's pixel changed
+    by `history_release` levels of 255 or more, none of the gate survives, and by less, a
+    share that falls linearly with the change. Without motion vectors the history at a
+    pixel something moved across is what was there before, and a gate that reads 0.6 over
+    a whole Tekken frame kept a trail of it behind everything that moved. It lowers only
+    the gate — never the floor, which is zero wherever the game changed a pixel anyway.
 
     `intensity` blends the model's picture against the source, per pixel when a
     ControlMask supplies its red channel. `detail_strength` and `colour_strength`
@@ -336,16 +456,36 @@ def compose(head, color, *, intensity=1.0, detail_strength=1.0, colour_strength=
             history = np.asarray(history, dtype=np.float32)
             if history.shape != color.shape:
                 raise ValueError("history must match the colour image shape")
-            # The gate stays in NumPy even when the rest goes native: `expf` and NumPy's
-            # float32 exponential disagree in the last bit, and the floor folds into it
-            # here, so what is left for C is the residual, the blend and the clamps.
-            alpha = history_weight(head, blend_scale=blend_scale)
-            if history_confidence != 1.0:
+            previous = (history_previous if history_previous is not None
+                        and (history_hold > 0 or history_release > 0) else None)
+            slope_release = release_slope(history_release)
+            if nr_image is not None and history_floor is None:
+                # Everything temporal in the one native pass: the gate from its table (the
+                # exp that kept it in NumPy is inside the table), the confidence, and the
+                # floor from the game's previous frame in the same folded multiply-add-clip
+                # as `hold_floor`. 7 ms of NumPy at a 1280x720 output.
+                confidence = (float(np.clip(np.float32(history_confidence), 0, 1))
+                              if history_confidence != 1.0 else 1.0)
+                composed = nr_image.compose_temporal(
+                    head, color, history, previous, None, control_mask,
+                    intensity=intensity, blend_scale=blend_scale,
+                    hold=float(history_hold) if previous is not None else 0.0,
+                    slope=(float(np.float32(-255.0 * history_hold / HOLD_RAMP))
+                           if previous is not None else 0.0),
+                    table=gate_table(float(blend_scale)), confidence=confidence,
+                    release=slope_release if previous is not None else 0.0)
+            if previous is not None and history_floor is None and composed is None:
+                history_floor = hold_floor(color, previous, history_hold)
+            alpha = (history_weight(head, blend_scale=blend_scale)
+                     if composed is None else None)
+            if composed is None and history_confidence != 1.0:
                 alpha = alpha * np.clip(np.float32(history_confidence), 0, 1)
-            if history_floor is not None:
+            if composed is None and previous is not None and slope_release != 0.0:
+                alpha = alpha * release_factor(color, previous, slope_release)
+            if composed is None and history_floor is not None:
                 floor = np.clip(np.asarray(history_floor, dtype=np.float32), 0, 1)
                 np.maximum(alpha, floor * np.float32(blend_scale), out=alpha)
-            if nr_image is not None:
+            if composed is None and nr_image is not None:
                 composed = nr_image.compose_temporal(
                     head, color, history, None, alpha, control_mask,
                     intensity=intensity, blend_scale=blend_scale, hold=0.0, slope=0.0)
@@ -361,10 +501,53 @@ def compose(head, color, *, intensity=1.0, detail_strength=1.0, colour_strength=
                 blend = np.asarray(control_mask, dtype=np.float32)[..., :1] * blend
             composed = np.clip(color + blend * (predicted - color), 0, 1).astype(np.float32)
     else:
-        composed = compose_head(head, color, control_mask=control_mask,
-                                intensity=intensity)
+        # The still frame natively too: nr_compose clamps the blend to [0, 1] below 1 as
+        # compose_head does, and is byte-identical to it (test_native_image.py). It was
+        # only reached above 1, so photo mode and every cut paid 3.9 ms of NumPy at
+        # 512x288 for the same bytes.
+        if nr_image is not None and control_mask is None:
+            composed = nr_image.compose(head, color, intensity)
+        if composed is None:
+            composed = compose_head(head, color, control_mask=control_mask,
+                                    intensity=intensity)
     return compose_detail(color, composed, detail_strength=detail_strength,
                           colour_strength=colour_strength, radius=detail_radius)
+
+
+def compose_encode(head, color, encoded, *, top=0, left=0, bgra=True, intensity=1.0,
+                   control_mask=None, history=None, history_confidence=1.0,
+                   history_previous=None, history_hold=0.0, history_release=0.0,
+                   blend_scale=BLEND_SCALE, samples=None):
+    """`compose` of the head brought up to the colour's size, encoded into `encoded` at
+    (`top`, `left`), in one native pass; `None` where that pass does not apply, and then
+    nothing has been written.
+
+    The same composition as `resample` then `compose` then `nr_daemon.encode`, byte for
+    byte (`test_native_image.py`), for the cases the daemon meets live: a history with or
+    without a control mask, or a still frame without one, at detail and colour strength 1
+    — where `compose_detail` hands the composition back untouched. The parameters are
+    derived exactly as `compose`'s native branches derive them. With `samples`, a step,
+    returns `(composition, head samples)` — see `nr_image.compose_encode`.
+    """
+    if nr_image is None or (history is None and control_mask is not None):
+        return None
+    if history is None:
+        return nr_image.compose_encode(head, color, None, None, None, encoded, top=top,
+                                       left=left, bgra=bgra, intensity=intensity,
+                                       samples=samples)
+    previous = (history_previous if history_previous is not None
+                and (history_hold > 0 or history_release > 0) else None)
+    confidence = (float(np.clip(np.float32(history_confidence), 0, 1))
+                  if history_confidence != 1.0 else 1.0)
+    return nr_image.compose_encode(
+        head, color, history, previous, control_mask, encoded, top=top, left=left,
+        bgra=bgra, intensity=intensity, blend_scale=blend_scale,
+        hold=float(history_hold) if previous is not None else 0.0,
+        slope=(float(np.float32(-255.0 * history_hold / HOLD_RAMP))
+               if previous is not None else 0.0),
+        table=gate_table(float(blend_scale)), confidence=confidence,
+        release=release_slope(history_release) if previous is not None else 0.0,
+        samples=samples)
 
 
 def run_frame(model, color, *, intensity=1.0, detail_strength=1.0, colour_strength=1.0,

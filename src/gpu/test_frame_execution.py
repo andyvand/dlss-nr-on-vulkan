@@ -34,20 +34,34 @@ def main():
         # The first-ever run must work without warming buffers in block mode.
         recordings.clear()
         head = frame.run(features, execution='replay')
-        assert len(recordings) == 1
+        # the scratch plan's discovery, recorded and never run, then the graph itself
+        assert len(recordings) == 2, len(recordings)
         recordings.clear()
         np.testing.assert_array_equal(frame.run(features, execution='replay'), head)
         assert not recordings
         recordings.clear()
         np.testing.assert_array_equal(frame.run(features, execution='block'), head)
-        # Block mode submits once per block. With the card's memory unmapped it also cannot
-        # keep its host-copy reference for the five skips, which become device copies with
-        # a recording each — the same bytes, five more submissions.
-        expected = 78 if rt.staging else 73
+        # Block mode submits once per block. The five skips are the level buffers
+        # themselves, so there is nothing to copy — mapped or not, the same count.
+        expected = 73
         assert len(recordings) == expected, (len(recordings), expected)
         recordings.clear()
         np.testing.assert_array_equal(frame.run(features, execution='single'), head)
         assert len(recordings) == 1
+        # Both FFN schedules must produce the same complete frame and keep distinct
+        # cached recordings. All 52 grouped blocks together remove 536 dispatches.
+        counts = {}
+        original_batch = rt.batch_ffn
+        for mode in (False, True):
+            rt.batch_ffn = mode
+            passes = []
+            np.testing.assert_array_equal(frame.run(features, execution='replay', submits=passes), head)
+            counts[mode] = passes[0]
+            recordings.clear()
+            np.testing.assert_array_equal(frame.run(features, execution='replay'), head)
+            assert not recordings
+        assert counts[False] - counts[True] == 536, counts
+        rt.batch_ffn = original_batch
         changed = features.copy()
         changed[..., 4:7] *= np.float32(0.75)
         changed_head = frame.run(changed, execution='block')

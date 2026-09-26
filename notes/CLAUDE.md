@@ -155,7 +155,9 @@ Treat all of the above as *reported*, not verified. Verifying it is Phase 1's jo
    *Resolved differently than this expected:* **tiling was never needed.** The whole
    frame runs at once, and a shared scratch arena — blocks execute in sequence, so roles
    with disjoint lifetimes alias — brought 720p to **2.3 GiB** of device buffers and
-   made 1920x1080 fit without swapping. `notes/phase32-scratch-and-qk.md`. Do not
+   made 1920x1080 fit without swapping. `notes/phase32-scratch-and-qk.md`. Sizing each
+   role by the buffers a recording actually touches then took 720p to **0.7 GiB** and
+   1920x1088 from 2.9 to **1.2 GiB**, weights included (2026-09-26, HANDOFF). Do not
    retrofit tiling; there is nothing to retrofit it to.
 2. **No NVIDIA GPU exists on this machine or anywhere accessible.** There is no way to
    produce reference activations from the original binary. Ground truth must come from
@@ -373,13 +375,26 @@ layer is proven under a second Vulkan client, VKD3D-Proton on a 64-bit D3D12 tit
    the high-frequency band, because the detail is drawn at the wrong scale and no
    interpolator can reconstruct it — that is why the vendor's own arrangement puts DLSS
    after the pass. XeSS is the substitute and is unverified on Linux/Vulkan here.
-   `notes/phase37`.
+   `notes/phase37`. *The owner dropped the DLSS-SR research on 2026-09-22 — a reading of
+   `nvngx_dlss.dll`, kept only on the local branch `upscaler`; do not restart it unasked.*
 3. ~~**A DX12 game that starts.**~~ **Done, 2026-09-16: Mortal Kombat 1**, D3D12 through
    VKD3D-Proton, with a picture — run off the BitLocker Windows partition with the Proton
    prefix kept on Linux. Full render scale does not fit in memory beside it. `notes/phase62`.
    (DOA6LR still dies inside its own build: `phase41`.)
 
-**Performance inside the graph is finished, and now measured rather than inferred.**
+**Performance inside the graph was declared finished here, and that was wrong** — corrected
+2026-09-23: each pass is efficient, but over a third of the frame was passes that need not
+exist. Eight bit-identical fusions, shared memory kept inside 2 KB and a padded bottleneck
+took 1280x720 from 445 to 231 ms and the curve to `10 ms + 230 ms per megapixel`
+(`notes/improve-fusions.md`, `notes/improve-qkv-epilogue.md`, HANDOFF). The staged GEMM
+had been running on half its threads — 15.5 KB of shared memory a workgroup, where a core
+holds 128 KB between them; given all of them, and a partial last block, it took the curve to `9.4 ms + 196`
+(`notes/improve-shared-memory.md`, which also records a Mesa quirk that makes some *smaller*
+declarations slower and costs this frame nothing). And window attention and the fused
+feed-forward, with no L1 at their shared-memory size, fetched the same operands from L2 once
+per subgroup; sharing them took those passes to 0.48x and 0.6x and the curve to
+`8.9 ms + 162` (2026-09-25, same note). What follows is the
+per-pass record, which still stands.
 `xmx_profile()` timestamps every pass (`src/bench/frame_profile.py`): GEMM is 216 ms of
 488 at 720p and is register-bound; of the other 272 ms, every pass that only moves data
 runs at 61-104 GB/s against a machine ceiling of 70-91, and the only two below it are
@@ -390,8 +405,10 @@ handing work to the four E-cores (**-7 %** for a theoretical +2 %). `notes/phase
 `phase46`.
 
 **Both modes run in a real game.** Photo mode holds a frame while a trigger file exists;
-live mode (`NR_LAYER_LIVE=N`) runs continuously and reaches **10.6 fps at 512x288**, with
-the game set to that extent and the compositor doing the stretch. `src/layer/nr-ctl`
+live mode (`NR_LAYER_LIVE=N`) runs continuously — **26-27 ms a frame at 512x288 and at
+640x360** for the daemon alone (2026-09-26), 25 fps in Tekken 7 at 640x360 beside the game's
+own rendering and 17.3 at 1280x720 (`phase59`; 10.5 before the fusions) — with the game set to
+that extent and the compositor doing the stretch. `src/layer/nr-ctl`
 changes profile, intensity, both strengths, the render scale and the temporal knobs
 between frames without reloading the model, and `src/layer/nr-toggle` is the same three
 files on a key, because on Wayland only the compositor sees a key while a fullscreen game
@@ -437,5 +454,5 @@ src/     our code
 
 ---
 
-*Last updated 2026-09-11 (phases 49-57: the parallel tree mined, DOA6LR diagnosed, what the model computes in, the output extent's own costs, live rendering in a game, the flicker found and fixed, a switch on a key, a panel with the manual behind it, and the host passes in C). **Read `notes/HANDOFF.md` first** — it carries the current state and the traps. Owner runs Arch Linux, is comfortable at kernel/driver level,
+*Last updated 2026-09-25 (window attention and the fused feed-forward sharing their operands across subgroups; before that the fusions, the staged GEMM's shared memory, and a Mesa quirk found and a fix measured). **Read `notes/HANDOFF.md` first** — it carries the current state and the traps. Owner runs Arch Linux, is comfortable at kernel/driver level,
 prefers C for low-level work, and does not need concepts explained from scratch.*

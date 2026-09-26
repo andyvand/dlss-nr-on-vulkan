@@ -3,6 +3,9 @@
  *
  *   gemm_runner <spv> <M> <N> <K> <A.f16> <B.f16> <C.f32>
  *
+ * <spv> is a file, or — with the CMake build, which compiles every module in — a bare
+ * name such as gemm_coopmat.spv for the embedded one.
+ *
  * A is MxK float16, B is KxN float16, C is MxN float32, all row-major raw dumps.
  * Deliberately simple: host-visible coherent memory, one dispatch, fence wait.
  * This exists to be checked against the numpy reference, not to be fast.
@@ -11,13 +14,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
+#include "nr_shaders_embedded.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define VKOK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "%s:%d: %s -> %d\n", __FILE__, __LINE__, #x, _r); exit(1); } } while (0)
 
 static void *slurp(const char *path, size_t *len)
 {
+#if defined(_WIN32) && __STDC_WANT_SECURE_LIB__
+    FILE *f = NULL;
+    fopen_s(&f, path, "rb");
+#else
 	FILE *f = fopen(path, "rb");
+#endif
+
 	if (!f) { perror(path); exit(1); }
 	fseek(f, 0, SEEK_END); *len = ftell(f); fseek(f, 0, SEEK_SET);
 	void *p = malloc(*len);
@@ -70,7 +84,21 @@ int main(int argc, char **argv)
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 				  .pApplicationName = "gemm_runner",
 				  .apiVersion = VK_API_VERSION_1_3 };
-	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+	/* Behind the loader on macOS, MoltenVK is a portability driver and hidden until
+	 * the instance asks for it; elsewhere the extension is absent and nothing is asked. */
+	uint32_t nie = 0;
+	vkEnumerateInstanceExtensionProperties(NULL, &nie, NULL);
+	VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie);
+	vkEnumerateInstanceExtensionProperties(NULL, &nie, ie);
+	int portability = 0;
+	for (uint32_t i = 0; i < nie; i++)
+		if (!strcmp(ie[i].extensionName, "VK_KHR_portability_enumeration")) portability = 1;
+	free(ie);
+	const char *iext[] = { "VK_KHR_portability_enumeration" };
+	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+				     .flags = portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0u,
+				     .enabledExtensionCount = portability ? 1u : 0u,
+				     .ppEnabledExtensionNames = iext };
 	VkInstance inst;
 	VKOK(vkCreateInstance(&ici, NULL, &inst));
 
@@ -82,6 +110,19 @@ int main(int argc, char **argv)
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(pd, &props);
 	fprintf(stderr, "device: %s\n", props.deviceName);
+	/* Ask for the matrix extension only where it exists; the shader handed in has to
+	 * match (`gemm_portable_desc.spv` where it does not), which is the caller's job. */
+	uint32_t nde = 0;
+	vkEnumerateDeviceExtensionProperties(pd, NULL, &nde, NULL);
+	VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de);
+	vkEnumerateDeviceExtensionProperties(pd, NULL, &nde, de);
+	int coopmat = 0, subset = 0;
+	for (uint32_t i = 0; i < nde; i++) {
+		if (!strcmp(de[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) coopmat = 1;
+		if (!strcmp(de[i].extensionName, "VK_KHR_portability_subset")) subset = 1;
+	}
+	free(de);
+	fprintf(stderr, "path: %s\n", coopmat ? "cooperative matrix" : "portable multiply-add (no VK_KHR_cooperative_matrix)");
 
 	uint32_t nq = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, NULL);
@@ -93,14 +134,23 @@ int main(int argc, char **argv)
 	if (qi == UINT32_MAX) { fprintf(stderr, "no compute queue\n"); return 1; }
 
 	/* Feature chain: cooperative matrix needs the memory model, fp16 arithmetic
-	 * and 16-bit storage buffers all switched on explicitly. */
+	 * and 16-bit storage buffers all switched on explicitly. The integer twin
+	 * (`gemm_coopmat_int8.comp`, configuration 4) needs the 8-bit pair as well; asking
+	 * for both costs nothing and lets one runner check either kernel. */
 	VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
 		.cooperativeMatrix = VK_TRUE };
+	/* The 8-bit pair is asked for only where the device has it (MoltenVK and the phones
+	 * do not all): without it the float kernels are unaffected and the integer one fails
+	 * to load, which is the caller's business. */
+	VkPhysicalDeviceVulkan12Features have12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+	VkPhysicalDeviceFeatures2 have2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12 };
+	vkGetPhysicalDeviceFeatures2(pd, &have2);
 	VkPhysicalDeviceVulkan12Features v12 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-		.pNext = &cm, .vulkanMemoryModel = VK_TRUE,
-		.vulkanMemoryModelDeviceScope = VK_TRUE, .shaderFloat16 = VK_TRUE };
+		.pNext = coopmat ? (void *)&cm : NULL, .vulkanMemoryModel = VK_TRUE,
+		.vulkanMemoryModelDeviceScope = VK_TRUE, .shaderFloat16 = VK_TRUE,
+		.shaderInt8 = have12.shaderInt8, .storageBuffer8BitAccess = have12.storageBuffer8BitAccess };
 	VkPhysicalDeviceVulkan11Features v11 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
 		.pNext = &v12, .storageBuffer16BitAccess = VK_TRUE };
@@ -109,25 +159,34 @@ int main(int argc, char **argv)
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 					.queueFamilyIndex = qi, .queueCount = 1, .pQueuePriorities = &prio };
-	const char *devext[] = { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME };
+	const char *devext[2]; uint32_t next = 0;
+	if (coopmat) devext[next++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+	if (subset) devext[next++] = "VK_KHR_portability_subset";
 	VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
 				   .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-				   .enabledExtensionCount = 1, .ppEnabledExtensionNames = devext };
+				   .enabledExtensionCount = next, .ppEnabledExtensionNames = devext };
 	VkDevice dev;
 	VKOK(vkCreateDevice(pd, &dci, NULL, &dev));
 	VkQueue queue;
 	vkGetDeviceQueue(dev, qi, 0, &queue);
 
-	struct buf A = make_buf(dev, pd, (VkDeviceSize)M * K * 2);
-	struct buf B = make_buf(dev, pd, (VkDeviceSize)K * N * 2);
-	struct buf C = make_buf(dev, pd, (VkDeviceSize)M * N * 4);
+	/* The operand width comes from the files, not from a flag: two bytes an element is
+	 * the float kernel, one byte the integer one, and a file that is neither size is a
+	 * caller error worth naming rather than a buffer overrun worth debugging. The
+	 * accumulator is four bytes either way — float for config 1, int32 for config 4. */
 	size_t la, lb;
 	void *pa = slurp(argv[5], &la), *pb = slurp(argv[6], &lb);
-	if (la != A.size || lb != B.size) {
-		fprintf(stderr, "input size mismatch: A %zu want %llu, B %zu want %llu\n",
-			la, (unsigned long long)A.size, lb, (unsigned long long)B.size);
+	size_t wanted_a = (size_t)M * K, wanted_b = (size_t)K * N;
+	size_t width = la == wanted_a ? 1 : (la == wanted_a * 2 ? 2 : 0);
+	if (!width || lb != wanted_b * width) {
+		fprintf(stderr, "input size mismatch: A %zu, B %zu; expected %zu and %zu "
+			"(int8) or %zu and %zu (fp16)\n", la, lb, wanted_a, wanted_b,
+			wanted_a * 2, wanted_b * 2);
 		return 1;
 	}
+	struct buf A = make_buf(dev, pd, (VkDeviceSize)la);
+	struct buf B = make_buf(dev, pd, (VkDeviceSize)lb);
+	struct buf C = make_buf(dev, pd, (VkDeviceSize)M * N * 4);
 	memcpy(A.p, pa, la); memcpy(B.p, pb, lb); memset(C.p, 0, C.size);
 
 	VkDescriptorSetLayoutBinding bind[3];
@@ -146,8 +205,25 @@ int main(int argc, char **argv)
 	VkPipelineLayout playout;
 	VKOK(vkCreatePipelineLayout(dev, &pli, NULL, &playout));
 
-	size_t spvlen;
-	void *spv = slurp(argv[1], &spvlen);
+	/* As libxmx resolves a shader: a bare name (`gemm_coopmat.spv`) is the module compiled
+	 * into this executable; a path is a file; a path whose file is missing falls back to
+	 * the embedded module of the same base name. */
+	size_t spvlen = 0;
+	const void *spv = NULL;
+	const struct nr_embedded_shader *embedded = NULL;
+	const char *base = argv[1];
+	for (const char *q = argv[1]; *q; q++)
+		if (*q == '/' || *q == '\\') base = q + 1;
+#ifdef NR_EMBEDDED_SHADERS
+	for (size_t i = 0; i < nr_embedded_shader_count; i++)
+		if (!strcmp(nr_embedded_shaders[i].name, base)) embedded = &nr_embedded_shaders[i];
+#endif
+	if (embedded && base == argv[1]) { spv = embedded->data; spvlen = embedded->size; }
+	else if (embedded) {
+		FILE *probe = fopen(argv[1], "rb");
+		if (probe) fclose(probe); else { spv = embedded->data; spvlen = embedded->size; }
+	}
+	if (!spv) spv = slurp(argv[1], &spvlen);
 	VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 					 .codeSize = spvlen, .pCode = spv };
 	VkShaderModule sm;
@@ -202,7 +278,13 @@ int main(int argc, char **argv)
 	VKOK(vkQueueSubmit(queue, 1, &si, fence));
 	VKOK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 30ull * 1000 * 1000 * 1000));
 
+#if defined(_WIN32) && __STDC_WANT_SECURE_LIB__
+    FILE *out = NULL;
+    fopen_s(&out, argv[7], "wb");
+#else
 	FILE *out = fopen(argv[7], "wb");
+#endif
+
 	if (!out) { perror(argv[7]); return 1; }
 	fwrite(C.p, 1, C.size, out);
 	fclose(out);

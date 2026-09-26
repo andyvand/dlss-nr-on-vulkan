@@ -1,12 +1,15 @@
-# DLSS 5 Neural Rendering on macOS
+# DLSS 5 Neural Rendering on Vulkan, Metal and Direct3D12
 
 NVIDIA's DLSS 5 Neural Rendering pass — the one-step pixel-space diffusion model that
-re-renders a frame's detail — running on an **Intel Arc 140V (Lunar Lake, Xe2)**
-integrated GPU under Linux, in a real game, through a Vulkan layer.
+re-renders a frame's detail — running on **Any Vulkan enabled card**
+integrated GPU under macOS, Android, Linux and Windows in a real game, through a Vulkan layer.
 
 No NVIDIA hardware, no NGX, no CUDA. The graph runs on Intel's XMX matrix units through
 `VK_KHR_cooperative_matrix`, and the pass is injected at `vkQueuePresentKHR`, so it
 attaches to anything that presents with Vulkan — including a Windows game under Proton.
+Where there is no cooperative matrix at all — an Apple M3 through MoltenVK is the case
+that was built and tested — the same graph runs on a plain multiply-add GEMM, slower and
+with the same numbers.
 
 **This is a research port, not a product.**  
 Read "What to expect" before deciding it is broken.
@@ -65,7 +68,7 @@ what goes is skin detail or the game's own sharpening has not been measured.
 Across all of them, what the pass adds in one place it takes from another. **Whether any of
 it is better is taste, not measurement** — it is photographic where the games are stylised.
 
-These are stills. Live, Tekken 7 runs at **10.5 fps at 640x360**.
+These are stills. Live, Tekken 7 runs at **25 fps at 640x360**.
 
 <sub>Tekken 7 © Bandai Namco Entertainment. Dead or Alive 5 Last Round © Koei Tecmo Games.
 Mortal Kombat 1 © Warner Bros. Entertainment Inc.; its guest characters belong to their
@@ -110,25 +113,39 @@ already have. See [Build](#build).
 
 ## What you need
 
-- An Intel GPU that exposes `VK_KHR_cooperative_matrix` with a `fp16 x fp16 -> fp32`
-  configuration. Developed and measured on **Arc 140V / Xe2, Mesa ANV**; an Arc B580
-  (discrete Battlemage) reports the same six configurations. A Vulkan device alone is not
-  enough, and the probe needs neither weights nor the rest of the build:
+- An Intel **Xe2** GPU: `VK_KHR_cooperative_matrix` with an `fp16 x fp16 -> fp32`
+  configuration of **M=8, N=16, K=16**, which every XMX kernel here is written for.
+  Developed and measured on **Arc 140V (Lunar Lake), Mesa ANV**; an Arc B580 (discrete
+  Battlemage) reports the same six configurations. **Arc A-series (Alchemist, Xe-HPG) does
+  not qualify**: its matrix units report 8x8x16, so these kernels do not run there. A Vulkan
+  device alone is not enough, and the probe needs neither weights nor the rest of the build:
 
   ```sh
   gcc -Iwork/vulkan-headers/include src/probe/coopmat_probe.c -o /tmp/probe -lvulkan
   /tmp/probe      # drop the -I if your distribution installs the Vulkan headers
   ```
-- A **discrete** Arc works too, and does not need resizable BAR: where the card's memory
+- A **discrete** Xe2 card (Battlemage, B570/B580) works too, and does not need resizable BAR: where the card's memory
   cannot be mapped, the graph keeps its operands there anyway and the host reaches them by
   copies. Turn resizable BAR on if you can — it is the faster of the two paths and Arc wants
   it for everything else — but it is no longer the difference between working and crawling.
   This is written from one owner's report and tested by forcing the same path on the
   integrated GPU; it has not been measured on a discrete card.
-- Linux. Python 3 with NumPy. A C compiler, `glslangValidator`, the Vulkan loader.
+- **Without cooperative matrix** the runtime falls back to a portable multiply-add GEMM
+  behind the same dispatches, with every epilogue and store the matrix kernel has. Tested
+  on an **Apple M3 under macOS through MoltenVK 1.4.2**: `make test` is green there and the
+  GEMM runs at 480-570 GFLOP/s against the Xe2 matrix kernel's 1348-3828 — no frame has
+  been rendered on a Mac yet, only the contract checked (`notes/phase67`). Any Vulkan 1.3
+  device with `shaderFloat16`, `storageBuffer16BitAccess`, `bufferDeviceAddress` and the
+  Vulkan memory model should take the same path; `XMX_PORTABLE=1` forces it anywhere.
+- Linux, or macOS with MoltenVK. Python 3 with NumPy. A C compiler, `glslangValidator`,
+  the Vulkan loader.
 - **ImageMagick** for the still-frame tools, which read and write pictures through
   `magick`. The game path does not touch it.
-- About 2.3 GiB of memory for the device buffers at 720p — it shares system RAM.
+- **libpng** for the C command `work/nr_frame`, which reads and writes PNG with it and
+  needs nothing else. `make` finds it through pkg-config, Homebrew, vcpkg or `/usr/local`;
+  `PNG_CFLAGS` / `PNG_LIBS` override.
+- About 0.7 GiB of memory for the device buffers at 720p and 1.2 GiB at 1080p, the weights
+  included — it shares system RAM.
 - OpenCV is optional and worth having: it is the fast path for the blur that moving
   `detail_strength` or `colour_strength` needs — 32 ms against 110 at 854x480
   (`notes/phase48`). Everything else is the same without it.
@@ -154,12 +171,120 @@ python3 work/mlx-dlss/python/mlxdlss/tools/unpack_dlssnr_weights.py \
         work/mlxw/dlssnr-packed.safetensors work/mlxw/dlssnr-logical.safetensors
 ```
 
+On macOS, skip the Vulkan-Headers clone: `make` finds the headers and libraries under
+vcpkg, `/usr/local` or Homebrew (`make VK_PREFIX=/where/they/are` otherwise), links the
+compute runtime against MoltenVK directly, and writes `work/MoltenVK_icd.json` so the layer
+tests can reach MoltenVK through the loader. Metal's fast math is switched off by the
+runtime before the library loads; leave `MVK_CONFIG_FAST_MATH_ENABLED` alone, because with
+it on every vendor rounding point in the graph moves (`notes/phase67`).
+
+macOS also gets a **second compute runtime on Metal directly**: `work/libmetalmx.dylib`
+(`src/gpu/libmetalmx.m`) implements the same `xmx_*` entry points as libxmx, with the shaders
+rewritten in the Metal Shading Language (`src/gpu/metal/`) and compiled by Apple's `metal`
+into one `nr_shaders.metallib` that is embedded in the library. Its matrix path is
+`simdgroup_matrix` (half operands, float accumulate; exact on the GEMM contract), where
+MoltenVK has none. `NR_GPU_BACKEND=metal` switches every Python tool and the C frame library
+to it; `make test-metal` runs the GPU tests on it. On an M3 a 1280x720 frame takes 735-746 ms
+through it against 938-948 ms through MoltenVK (`notes/phase74`). It is built on Apple only —
+by `make` under Darwin, by CMake under `NR_BUILD_METAL` — and the Vulkan layer stays Vulkan.
+The static archive a host links, `libdlssnr`, is the Metal one on Apple: no Vulkan in it,
+`nr_frame_runtime()` says `"metal"`, and `nr_frame_adopt_vulkan` is refused there.
+
+Windows gets a **third runtime, on Direct3D 12**: `build/libd3dmx.dll` (`src/gpu/libd3dmx.c`)
+implements the same `xmx_*` entry points, with the kernels rewritten in HLSL (`src/gpu/d3d12/`)
+and compiled by `dxc` to nine DXIL modules that are embedded in the library.
+`NR_GPU_BACKEND=d3d12` switches every Python tool and the C frame library to it, and
+`ctest -R d3d12_` runs the GPU tests on it. It has no matrix path — HLSL ships no matrix-matrix
+operation, so every GEMM is the multiply-add kernel — and it takes the operands as root UAVs
+with byte offsets, splits dispatches at Direct3D's 65535 groups per axis, and keeps every half
+store on `f32tof16` so the half buffers hold what `half_round` gives. CMake builds it under
+`NR_BUILD_D3D12` — on by default for every Windows target but 32-bit x86 (x64 and ARM64) when
+`dxc` is found: the Windows SDK's, the Vulkan SDK's or vcpkg's `directx-dxc` — and wherever it
+is built `libdlssnr` is built from it (`NR_DLSSNR_D3D12`, following `NR_BUILD_D3D12`;
+`-DNR_DLSSNR_D3D12=OFF` keeps the Vulkan archive), with `nr_frame_adopt_d3d12` for a host that
+shares its `ID3D12Device`. **It is written and
+cross-built from macOS, and has not run anywhere yet** — `notes/phase75` says how to make the
+first run, and that a `dxc` without `dxil.dll` beside it writes unsigned DXIL the runtime takes
+only in developer mode.
+
 The result is 649 named tensors, **145 755 123 parameters**: the large matrices are
 stored in the DLL as FP8 E4M3, one byte each, and decoded to FP16. The reader checks
 `fully_logical=true` and refuses anything else — the packed file is **not** a substitute,
 and reading it as dense FP16 gives values correlating -0.02 with the truth.
 
-`make` also builds `work/libnr_image.so`: the full-frame passes around the network —
+**Or with CMake**, which is the same build for Linux, macOS and Windows. Everything lands
+in the build directory, flat, under the names `make` gives them in `work/`: the libraries,
+the executables, every `.spv`, the ICD manifest on macOS.
+
+```sh
+cmake -S . -B build && cmake --build build && ctest --test-dir build
+export NR_BUILD_DIR=$PWD/build          # for the Python outside ctest; see below
+```
+
+It finds the Vulkan SDK (or the headers clone above), MoltenVK on macOS, libpng for the
+`nr_frame` command, and registers every test with ctest. The Python — the daemon, the
+tests, the tools — finds either build through `src/nr_build.py`: `NR_BUILD_DIR` in the
+environment wins (ctest sets it for every test, `make test` pins its own `work/`), and
+without it the most recently built of `work/` and `build*/` is used, so switching between
+the two builds does not run last week's binaries from the other one. Only the inputs stay
+in `work/`: your weights under `work/mlxw/` and the headers clone. `-DNR_OUTPUT_DIR=work`
+reproduces the Makefile layout if you want one directory.
+
+**The weights compiled in.** The CMake build compiles `weights/` — the logical safetensors
+as C, one bin2c byte array per 8 MB slice plus a table — into `libnr_frame`, so
+`nr_frame_open(NULL)`, the `nr_frame` command without `--weights` and the VBA-M filter open
+no file at run time. That directory is used as it is; `-DNR_BIN2C_WEIGHTS=ON` (default OFF)
+regenerates it first from `dlssnr-logical.safetensors` in the source root, `work/mlxw/` or
+`-DNR_WEIGHTS_FILE=`, through `slice` and `bin2c`, and is skipped with a message when the
+file is absent. `-DNR_EMBED_WEIGHTS=OFF` builds a library that needs a path. Compiling a
+slice costs the compiler about 0.75 GB; `NR_EMBED_JOBS` (2) is how many run at once.
+
+**The CMake build compiles the weights in.** Given `dlssnr-logical.safetensors` — in the
+source root, under `work/mlxw/`, or named with `-DNR_WEIGHTS_FILE=` — it cuts the file into
+8 MB slices, turns each into a C byte array with `bin2c` (`src/tools/bin2c.c`, Rafael
+Kitover's, the tool the VBA-M GUI embeds its resources with) and links the lot into
+`libnr_frame`, so `nr_frame_open(NULL)`, the `nr_frame` command without `--weights`, the C
+test and `NativeFrame()` need no file at run time. The slicing is not decoration: a compiler
+holds a byte-array initializer one element at a time and clang wants about 90 bytes of memory
+per byte, so one array for the whole file would need ~25 GB; 8 MB slices cost ~0.75 GB each,
+two at a time (`NR_EMBED_CHUNK_MB`, `NR_EMBED_JOBS`), about two minutes on an M3. The
+library grows by the size of the file. `-DNR_EMBED_WEIGHTS=OFF` builds without them, and the
+generated headers stay in `build/weights/` — `*.safetensors` is ignored by git and the
+generated C never leaves the build directory, so the rule that no weights are committed holds.
+
+**The shaders are compiled in the same way.** Every `.spv` glslangValidator writes also goes
+through `bin2c` into `libxmx` and `gemm_runner` (`NR_EMBED_SHADERS`, on by default), and the
+runtime loads a shader by *name*: `gemm_coopmat.spv` is the embedded module, a path with a
+directory in it is a file — so `XMX_GEMM_SPV=/tmp/variant.spv` still measures a variant — and
+a path whose file is missing falls back to the embedded module of that name. The C library
+and the Python (`nr_build.shader_arg`) hand over bare names when the runtime has them, so a
+build directory with no `.spv` in it runs; the files are still written for the benches. On Windows it builds the compute
+runtime, the frame library, the command and the shaders with MSVC or clang-cl and the
+Vulkan SDK; the Vulkan layer and its tests are POSIX and stay off there
+(`-DNR_BUILD_LAYER`). Windows builds and links as a MinGW-w64 cross-compile from macOS (`libxmx.dll`,
+`libnr_frame.dll`, `nr_frame.exe`); nobody has yet *run* it on a Windows machine, and the
+MSVC path is configured, not measured (`notes/phase69`).
+
+**Android** builds with the NDK's own toolchain file and nothing else named:
+
+```sh
+cmake -S . -B build-android \
+      -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=28
+cmake --build build-android
+```
+
+It links the NDK's `libvulkan.so`, builds `bin2c` and `slice` for the machine doing the build
+(a compiler from your `PATH`; `-DNR_HOST_CC=` names one), compiles the weights and shaders in,
+and produces the libraries, `libdlssnr.a` and the executables — `test_dlssnr` runs from
+`/data/local/tmp` over `adb`. The `nr_frame` command needs a libpng for the target (vcpkg's
+`arm64-android` triplet has one); the Vulkan layer stays off, there being no game to hook.
+VBA-M's `tools/android/build-android-qt.sh` links `libdlssnr.a` into its Qt APK the same way.
+Built for arm64-v8a and armeabi-v7a; **not yet run on a device** — a phone has no cooperative
+matrix, so it takes the portable GEMM path, and needs a Vulkan 1.3 driver with `shaderFloat16`,
+`storageBuffer16BitAccess` and `bufferDeviceAddress` (`notes/phase72`).
+
+`make` also builds `work/libnr_image.so` (`.dylib` on macOS, as every library here): the full-frame passes around the network —
 feature assembly, the resizes, the composition, the 8-bit codecs — in C rather than NumPy,
 worth about 2.6x on the host side of a frame. It is built with `-march=native`, so rebuild
 it on the machine that runs it rather than copying it. Everything still works without it;
@@ -168,7 +293,45 @@ it on the machine that runs it rather than copying it. Everything still works wi
 ```sh
 make test                                        # 190-odd checks, fewer without weights
 python3 src/ref/nr_frame.py IN.png OUT.png --resident   # one still, no game
+work/nr_frame IN.png OUT.png                               # the same command, in C, no Python
 ```
+
+### The frame path as a C library
+
+`work/libnr_frame.so` — `.dylib` on macOS — (`src/ref/nr_frame.c`, API in `nr_frame.h`) is `nr_frame.py` in C:
+the weights read from the logical file, the whole graph recorded against `libxmx` exactly as
+the Python records it, the feature assembly and the composition around it. One call updates
+a frame:
+
+```c
+nr_frame *f = nr_frame_open("work/mlxw/dlssnr-logical.safetensors");
+nr_frame_params p; nr_frame_defaults(&p);           /* the `standard` profile */
+nr_frame_update(f, colour, height, width, NULL, NULL, &p, output, NULL);
+```
+
+`colour` and `output` are float32 RGB in [0, 1]; pass the previous output as `history` for
+the temporal path and the previous input as the fourth argument for its floor. The head it
+produces is **bit-identical** to the Python resident path on the same features
+(`src/ref/test_nr_frame_c.py`); the noise channels, the gate's sigmoid and the detail blur's
+kernel use the C library's transcendentals and can differ from NumPy's by a last bit, which
+the test measures. `work/nr_frame` is `nr_frame.py` itself in C — the same flags (`--profile`, `--style-index`, `--local-tone`, `--local-structure`, `--skin-structure`, `--auto-mask`, `--control-mask`, `--intensity`, `--intensity-ladder`, `--detail-strength`, `--colour-strength`, `--detail-radius`, `--frame-index`, `--size`, `--weights`, `-v`), the same printed lines, PNG in and out through **libpng** rather than ImageMagick (any PNG in, 8-bit RGB out, the same byte codec; `--size` is this project's own bilinear resample rather than ImageMagick's filter, so a resized run differs from the Python's in the resampled pixels and nowhere else). `src/ref/nr_frame_native.py` binds the library for NumPy callers, and `work/test_nr_frame` is the frame test in C (`--reference` takes the head the Python test writes, so the byte-for-byte check runs without Python too). On an Apple M3
+through MoltenVK a 1280x720 frame takes 0.90 s (`notes/phase68`).
+
+Two I/O switches, **both on by default since 2026-09-25**, in the Python path and in the C
+frame library alike: `NR_INPUT_FP16` builds the
+network's input as half, straight into the mapped input buffer, so neither a host copy
+nor a GPU conversion pass is left; `NR_COMPACT_HEAD` reads back only the four useful
+output channels, a quarter of the bytes. Neither can change a value. Set either to `0`
+in the daemon's environment, not only the game's, to compare. On a discrete card the
+compact head should matter more, since the read crosses PCIe; B570/B580 results are
+still needed. For exact checks and paired benchmarks, see
+[the I/O experiment notes](notes/improve-compact-io.md).
+
+`NR_JOINT_QKV=1` is another optional experiment: it combines preparation of Q, K
+and V into one dispatch, removing 140 passes per frame. It is **off by default**:
+on 140V at network extent 448x320 it increased warm frame time from 79.1 to 83.2 ms.
+See [the QKV experiment and diagnostic notes](notes/improve-joint-qkv.md) for exact
+checks, the paired benchmark and profiling commands for B570/B580.
 
 ## Run it in a game
 
@@ -200,8 +363,9 @@ run it again. Leave out `NR_LIVE=1` for photo mode. For a native Vulkan game,
 | `NR_LAYER_SOCKET` | where the daemon listens. **Required, no default** — without it the layer never contacts the daemon at all. The daemon and the tools use `/tmp/nr_layer.sock` |
 | `NR_LAYER_TRIGGER` | the file that means "do it". **Required for the toggle** — without it, live mode captures every frame whether the effect is on or not. The tools use `/tmp/nr_trigger` |
 | `NR_LAYER_LIVE=N` | live mode: every Nth present goes through the network |
+| `NR_LAYER_ASYNC=1` | with live mode: each processed present shows the answer for the one before it, so the daemon works while the game draws its next frame — more frames a second, one more frame of latency. Off by default; `NR_ASYNC=1 NR_LIVE=1 src/layer/nr-photo --steam <appid>` prints it into the launch option |
 | `NR_LAYER_UI_MASK=1` | mark pixels that held still and leave them as the game drew them |
-| `NR_LAYER_SYNC=semaphore` | wait on the present's own semaphores instead of draining the queue twice a frame — **for discrete cards, and still experimental**, see below |
+| `NR_LAYER_SYNC` | accepted for old launchers and ignored: there is one synchronisation path, described under **Capture synchronization** below |
 
 **If your frame rate drops as soon as the game starts and the daemon's log shows no frames**,
 one of the first four is missing or wrong: the layer is capturing and has nowhere to send it.
@@ -277,49 +441,61 @@ all of them move between frames. Only `profile` costs a forward pass.
 
 `0.05` to `1`, step `0.05`, default `1`
 
-The only knob that changes the frame rate. The network runs on a frame this much smaller, and what comes back is the *head* — the detail it drew — which is then scaled up and composed against the full-resolution original, so the game's own pixels are never resampled and only the synthesised part is interpolated. Cost follows the extent and nothing else: about 15 ms + 450 ms per megapixel. 0.55 is the measured compromise, but the *sign* of its effect on quality depends on how dark the scene is rather than on the number: on a bright frame 0.55 adds 15 % of local contrast to a kimono, on a dark crowd it takes 21 % away.
+The only knob that changes the frame rate. The network draws its detail on a frame this much smaller; the detail is then scaled up and laid over the game's full-resolution frame, so the game's own pixels are never resampled. Lower is faster and draws coarser detail. The network never runs below 320 pixels on a side, so on a small window the low scales all cost the same: at 512x288, everything up to about 0.6 runs the same 320x320 network. For play, 0.35-0.6 is the useful range. For screenshots 0.9 tends to look better than 1.0: at exactly the display size the network is handed the game's raw pixels, jagged edges and all, turns part of them into pixel-level grain, and its effect comes out weaker. Cost on an Arc 140V: about 9 ms plus 162 ms per megapixel of network frame.
 
-### `profile` — which way to trade skin texture against speculars
+### `min_extent` — the smallest side the network's frame is padded to
+
+`128` to `320`, step `64`, default `320`
+
+The network's frame is padded, by mirroring the picture, to at least this many pixels on a side. 320 is what NVIDIA's own driver does; the network itself runs down to 128. At small live sizes most of a 320 frame is padding, so a lower floor is much faster — on an Arc 140V, 512x288 at scale 0.35 takes 29 ms a frame at 320 and 15 at 128 — and draws a somewhat different picture, since the network no longer sees a mirrored copy of the scene around it. Neither is wrong; compare them in a game. It changes nothing once the scaled frame is larger than this anyway.
+
+### `profile` — which way to trade skin texture against highlights and colour
 
 `standard` / `natural` / `cinematic` / `neutral`
 
-The three conditioning scalars the network is given. They are a clean monotone trade, not a quality ladder: everything the pass adds to skin texture it takes out of speculars and colour, and the profile chooses where on that curve to sit. `standard` is the better default for a game with bright, near-clipping skin. `cinematic` does not merely add less on such a frame — it *removes* detail, smoothing sand grain that `standard` keeps. `neutral` sets tone and structure to zero. Changing this costs a forward pass, unlike everything below it.
+The style the network is asked for. The profiles are a trade, not a quality ladder: what one adds to skin and surface texture it takes from highlights and colour. `standard` is the default and adds the most texture; `natural` and `cinematic` keep more of the highlights and colour, and on very bright scenes `cinematic` can smooth fine detail rather than add it. `neutral` all but switches the effect off. The profile is an input to the network, so it takes effect on the next frame the network draws; the knobs below act after it.
 
 ### `intensity` — how far to go towards the model's picture, or past it
 
 `0` to `2`, step `0.05`, default `1`
 
-Blends the model's answer against the source, per pixel where an interface mask supplies one. At 1 you get the model's picture; below it you get part of the way there; above it the blend extrapolates *past* the model, which the vendor's own panel allows to 2 and ships screenshots at 1.66. Post-network and free: sweeping it does not re-run anything.
+Blends the model's picture with the game's own. 1 is the model's picture, 0 is the game's frame untouched, and values between are part of the way. Above 1 the blend goes past the model and exaggerates what it changed, which can look overdone. Free to change: nothing is re-run.
 
-### `detail_strength` — re-weights the high-frequency half of the change
-
-`0` to `2`, step `0.05`, default `1`
-
-After the blend, the difference the pass made is split into bands and each is re-weighted. This is the fine half — pores, strands, grain. Away from 1 it costs a Gaussian over the whole frame, about 7x more without OpenCV than with it.
-
-### `colour_strength` — the low-frequency half — and it runs backwards from its name
+### `detail_strength` — how strongly to apply the fine detail the pass adds
 
 `0` to `2`, step `0.05`, default `1`
 
-The coarse half of the same split: tone and colour rather than detail. **It does not restore colour.** 1.5 is the most aggressive of the measured settings — iris saturation 16.8 → 8.8, half again below the default — because it scales the strength of the pass's colour term, not the colour that survives. The name invites the opposite reading and this project spent a measurement finding out.
+The change the pass makes is split into fine detail — pores, hair, grain — and broad tone. This scales the fine part: 0 keeps only the tonal change, above 1 sharpens further, and past about 2 it over-sharpens. Away from 1 it costs one blur over the whole frame.
 
-### `temporal` — how much of the model's own history gate to trust
+### `colour_strength` — how strongly to apply the pass's change of tone and colour
+
+`0` to `2`, step `0.05`, default `1`
+
+The broad half of the same split: how much of the pass's change in tone and colour is applied. It does not add colour back. The pass tends to calm bright, saturated areas, and this scales that change — so above 1 colours can look more washed out, not richer, and 0 keeps the game's own tone with the detail on top.
+
+### `temporal` — how much of the previous frame to carry over
 
 `0` to `1`, step `0.05`, default `1`
 
-The previous output is fed back into the network's history channels, and the model's learned gate decides per pixel how much of it survives into this frame. This scales that gate. 0 turns the path off entirely, is bit-identical to drawing each frame alone, and clears the stored frame so switching back on cannot resurrect a stale one. Worth about 4 % of the frame time.
+Each frame, the previous result is fed back to the network, which decides per pixel how much of it to keep; that is what keeps the picture from shimmering. This scales how much it keeps. 0 draws every frame on its own and forgets the stored frame, so turning it back on cannot bring back an old one. Costs a few per cent of the frame time.
 
-### `hold` — how hard to hold pixels the game did not move
+### `hold` — how firmly to keep areas the game did not change
 
 `0` to `1`, step `0.05`, default `1`
 
-A floor under that gate, which the gate needs: the model is global, so on a frame where most things move it reads 0.12 even over pixels that did not move at all. Where the game handed back the same pixel the previous output is right for that pixel by construction, and this says so. It cannot ghost — the frame that changes a pixel is the frame that releases it. Together with `temporal` it takes the invention over still pixels from 3.25 levels of 255 to 0.87.
+Where the game hands back exactly the same pixel as last frame, the previous result is still right for it, so it is kept at least this firmly. This is what stops still areas — backgrounds, a waiting character — from shimmering while something else moves. It cannot leave a trail: the first frame in which the game changes a pixel lets go of it.
 
-### `cut_limit` — the frame-to-frame change that counts as a new shot
+### `release` — change, in levels of 255, that drops the previous frame where something moved
+
+`0` to `64`, step `1`, default `24`
+
+The other side of `hold`. Where the game's own pixel changed by this many levels of 255 or more, something moved there, and the previous result is dropped for that pixel; smaller changes keep a share that falls with the change. It is what prevents trails behind moving objects, since the layer has no motion vectors to follow them with. 16-24 is the useful range: lower drops more and the picture starts to shimmer over moving things, 0 turns it off and trails come back.
+
+### `cut_limit` — how big a change between frames counts as a new scene
 
 `0` to `1`, step `0.01`, default `0.15`
 
-Mean absolute change between two presents above which the shot is taken to have cut and the history is thrown away. The gate rejects wrong history per pixel on its own, but it was characterised on a pan at full scale, so a whole-frame replacement — a round transition, a replay, a menu — is worth refusing outright.
+The average change between two frames above which the scene is taken to have cut — a camera cut, a menu, a replay — and the previous frame is dropped entirely instead of pixel by pixel. Lower cuts more readily; 1 never cuts.
 
 <!-- knobs:end -->
 
@@ -327,19 +503,21 @@ Mean absolute change between two presents above which the shot is taken to have 
 
 <!-- rates:begin -->
 
-Measured through the socket on 2026-09-18 by `python3 src/bench/live_rates.py` — the whole round trip a game waits for, median of five frames, not graph time alone:
+Measured through the socket on 2026-09-26 by `python3 src/bench/live_rates.py` — the whole round trip a game waits for, median of nine frames, not graph time alone:
 
 | swapchain | render scale | ms | fps |
 | --- | ---: | ---: | ---: |
-| 512x288 | 0.35 | 72 | 13.9 |
-| 512x288 | 0.50 | 72 | 14.0 |
-| 640x360 | 0.35 | 74 | 13.5 |
-| 640x360 | 0.50 | 80 | 12.5 |
-| 854x480 | 0.50 | 105 | 9.5 |
-| 1024x768 | 0.55 | 168 | 6.0 |
-| 1920x1080 | 0.55 | 412 | 2.4 |
+| 512x288 | 0.35 | 26 | 39.2 |
+| 512x288 | 0.50 | 26 | 38.5 |
+| 640x360 | 0.35 | 26 | 38.8 |
+| 640x360 | 0.50 | 26 | 37.7 |
+| 854x480 | 0.50 | 32 | 31.0 |
+| 1024x768 | 0.55 | 48 | 20.6 |
+| 1920x1080 | 0.55 | 111 | 9.0 |
 
-That is the daemon's own cost with nothing else on the GPU. A game adds its own frame to it: **Tekken 7** measured **10.5 fps at 640x360** in a live fight (`notes/phase59`).
+Medians of three runs with swap empty, which agreed within 10 %. On 2026-09-23, with 5.5 GiB in zram and the kernel's memory-pressure figures rising, 1920x1080 ran anywhere from 322 to 463 ms: if that row is much slower for you, look at swap before anything else.
+
+That is the daemon's own cost with nothing else on the GPU. A game adds its own frame to it: **Tekken 7** ran at **25 fps at 640x360** in a live session on 2026-09-24, against 10.5 fps nine days earlier (`notes/phase59`).
 
 <!-- rates:end -->
 
@@ -348,11 +526,23 @@ at the *output* resolution regardless of the render scale, so the swapchain size
 as much as the scale does. A game at 512x288 with the compositor stretching to the panel
 is the fastest arrangement there is.
 
-The graph itself is finished as an optimisation target: GEMM is 216 ms of 488 at 720p and
-is register-bound, and every pass that only moves data already runs at the machine's
-memory ceiling. Tiling, operand staging, integer weights, the accumulator format, OpenCL,
-shared-memory bank padding and handing work to the E-cores have all been measured and all
-are closed. `notes/phase45`, `notes/phase46`.
+Inside the graph, the passes themselves are done: GEMM is register-bound, and every pass
+that only moves data runs at the machine's memory ceiling. Tiling, operand staging, integer
+weights, the accumulator format, OpenCL, shared-memory bank padding and handing work to the
+E-cores have all been measured and all are closed (`notes/phase45`, `notes/phase46`). What
+did move the graph was deleting passes: a pass at the memory ceiling that need not exist is
+all waste. Folding the residuals into the projections, attention into one pass with its
+head merge, Q/K normalisation and the window partition into the QKV projection's own
+epilogue and loads, the narrow blocks' feed-forward into one kernel and the full-resolution
+glue into fewer passes took a 1280x720 frame from 445 to 231 ms, 48 %, with every output
+bit-identical
+(`notes/improve-fusions.md`, `notes/improve-qkv-epilogue.md`). The other thing that moved it
+was shared memory, which decides how many workgroups a core holds: 128 KB between them,
+each share rounded up to 1, 2, 4 ... KB. Window attention at 3104 bytes took 4 KB and so half
+the core's threads, and at exactly 2 KB is 18 % faster; the staged GEMM at 15.5 KB took 16
+and half the threads too — with its tiles and its stage sharing 8 KB, the 1280x720 frame
+went from 228 to 208 ms (`notes/improve-shared-memory.md`, which also has a driver quirk
+that makes some *smaller* declarations slower).
 
 ## How it works
 
@@ -407,8 +597,8 @@ library; `make work/libnr_layer32.so` builds it and `prepare_layer.py` writes bo
 manifests.
 
 **It is unbearably slow.** Look at the swapchain size before the render scale. See the
-table above; 1920x1080 is 2.4 fps in the daemon alone and nothing will fix that but a
-smaller window.
+table above; at 1920x1080 the daemon alone manages about 4 fps, and nothing will fix that
+but a smaller window.
 
 **`GPU lost, stopping` in the daemon's log** — or, from a clone older than 2026-09-17,
 `frame rejected/failed ... xmx_graph_run: resident submit (-4)` on every frame. `-4` is
@@ -438,16 +628,31 @@ should not happen any more, so report it. Each frame line then ends with
 dominate, the traffic is the problem; if the middle one does, the graph is. `XMX_STAGING=1`
 and `=0` force the two memory paths for a comparison.
 
-**You have a discrete card and want to help.** `NR_LAYER_SYNC=semaphore` is the reason that
-switch exists. By default the layer drains the whole queue twice per present to know the
-frame is finished — a sledgehammer that also ignores the semaphores the present brought, so a
-game that renders on one queue and presents from another can hand over an unfinished image.
-The semaphore path does it properly. On the integrated chip this was built on it measures
-**exactly the same** — 210 ms a frame either way in Tekken 7 — because the game's own work is
-nothing beside the network. On a card fast enough for the game to matter, it should be the
-difference; nobody has measured that yet. It is tested here on a headless swapchain and in
-two games (D3D11 and D3D9 under DXVK), which is why it is a switch rather than the default.
-Turn it on, play, and say whether anything tore, stalled or looked stale.
+**Capture synchronization.** The layer waits on all semaphores supplied to the current
+present, then waits for its own copy fences before the CPU reads or reuses the staging
+buffer. It never waits on other application queues or recycles a semaphore still owned by
+presentation. `NR_LAYER_SYNC=idle` and `=semaphore` remain accepted as legacy aliases for
+this single path. The headless test uses separate queues and delayed writes; its negative
+control must detect a layer with the wait deliberately removed. See
+[the synchronization and MK1 check](notes/improve-present-fences.md).
+
+**Direct Proton launch exits before rendering.** `nr-photo --proton` now supplies
+`SteamAppId`, `SteamGameId` and `STEAM_COMPAT_APP_ID`, as Steam normally does. For a log:
+
+```sh
+PROTON_LOG=1 NR_PROTON=/path/to/Proton/proton src/layer/nr-photo --proton <appid> /path/to/game.exe
+```
+
+The launcher prints the runtime and log path (`work/proton-logs` by default).
+`--check-proton` verifies paths, not a successful game launch. If several Proton installs
+are found, select the one wanted with `NR_PROTON`, or launch through Steam.
+
+**The game vanishes when loading characters or a level.** Check the kernel journal for
+an OOM kill before diagnosing a GPU error. On a shared-memory iGPU, the game and every
+resident daemon compete for the same RAM. During the MK1 check, a second daemon and a
+1920x1200 swapchain exhausted memory; stopping the duplicate and using a smaller window
+allowed real frames to be processed. A small render scale reduces the network's buffers,
+but does not shrink the game's textures or all full-resolution host passes.
 
 **The interface is being re-rendered.** `NR_LAYER_UI_MASK=1` marks pixels that did not
 move between two presents and gives them back byte-identical. It drops itself when it

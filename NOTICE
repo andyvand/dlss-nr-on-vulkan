@@ -33,6 +33,11 @@ technique, and they remain their publishers' property.
 Third-party work this depends on
 --------------------------------------------------------------------------------
 
+bin2c — https://github.com/rkitover/bin2c
+  Copyright (c) 2016 Rafael Kitover, BSD 2-Clause License. `src/tools/bin2c.c` is that
+  program, unchanged; the CMake build runs it to compile the owner's weights file into
+  libnr_frame. The weights it embeds are the owner's and are not distributed.
+
 MLX-DLSS — https://github.com/iamwavecut/MLX-DLSS
   Copyright the MLX-DLSS authors, licensed under the Apache License 2.0.
   This project reads its numpy modules at runtime and reproduces its weight
@@ -46,6 +51,10 @@ Vulkan-Headers — https://github.com/KhronosGroup/Vulkan-Headers
 --------------------------------------------------------------------------------
 Provenance within this repository
 --------------------------------------------------------------------------------
+
+src/gpu/test_gemm_contract.py came back from uzbekunknown/dlss-nr-on-intel, which
+adapted this tree's CMake build and GEMM checks (commit 74bc1f7) and strengthened the
+epilogue and destination-guard tests.
 
 This project was written by AI agents: Claude Opus 5 in this tree, and Astra in a parallel
 one by the same owner. `src/ref/nr_image.c` began in that parallel tree and was extended

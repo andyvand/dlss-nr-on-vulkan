@@ -175,6 +175,43 @@ def test_composition():
           frame.PROFILES["neutral"]["local_tone_strength"] == 0
           and frame.PROFILES["neutral"]["local_structure_strength"] == 0)
 
+    # The temporal gate is a table over the half logit's 16 bits; it must be the formula on
+    # every one of them, NaN and infinity included, and on logits that are not yet half.
+    every = np.arange(1 << 16, dtype=np.uint32).astype(np.uint16).view(np.float16)
+    grid = np.zeros((256, 256, 4), np.float32)
+    grid[..., 3] = every.astype(np.float32).reshape(256, 256)
+    with np.errstate(over="ignore", invalid="ignore"):
+        want = frame.gate_formula(frame.half(grid[..., 3:4]))
+    check("the gate table is the formula on all 65536 half logits",
+          np.array_equal(want.view(np.uint32), frame.history_weight(grid).view(np.uint32)))
+    logits = (rng.standard_normal((97, 131, 4)) * 4).astype(np.float32)
+    check("... and on logits that are not half yet, through a strided view",
+          np.array_equal(frame.gate_formula(frame.half(logits[::2, :, 3:4])).view(np.uint32),
+                         frame.history_weight(logits[::2]).view(np.uint32)))
+
+
+def test_geometry():
+    """The network's extent: the vendor's floor by default, the graph's on request."""
+    print("network geometry")
+    import nr_frame as frame
+    sizes = [(w, h) for w in (64, 101, 179, 256, 320, 321, 640, 1280, 1920)
+             for h in (64, 101, 180, 288, 320, 704, 720, 1080)]
+    same = all(frame.network_geometry(w, h) == frame.NetworkGeometry.vendor_aligned(w, h)
+               for w, h in sizes)
+    check("the default floor is NetworkGeometry.vendor_aligned, on 72 sizes", same)
+    small = frame.network_geometry(320, 180, minimum=128)
+    check("at the graph's floor a 320x180 frame runs at 320x192",
+          (small.network_width, small.network_height) == (320, 192),
+          f"{small.network_width}x{small.network_height}")
+    floor = frame.network_geometry(100, 60, minimum=64)
+    check("no floor below the graph's 128", (floor.network_width, floor.network_height) == (128, 128),
+          f"{floor.network_width}x{floor.network_height}")
+    extents = [frame.network_geometry(w, h, minimum=m) for w, h in sizes for m in (128, 192, 256)]
+    check("every extent a multiple of 64 that covers the frame",
+          all(g.network_width % 64 == 0 and g.network_height % 64 == 0
+              and g.network_width >= g.output_width and g.network_height >= g.output_height
+              for g in extents))
+
 
 def test_temporal():
     """The temporal contract, none of which needs a forward pass."""
@@ -292,6 +329,7 @@ def main():
 
     test_primitives()
     test_composition()
+    test_geometry()
     test_temporal()
     test_display_codec()
     test_accelerator()

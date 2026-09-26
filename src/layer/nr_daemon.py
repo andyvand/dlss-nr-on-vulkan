@@ -112,10 +112,19 @@ def encode(image, raw, vk_format):
 
 
 def receive(connection, count, probe_ok=False):
+    # Straight into one buffer where the socket allows it: collecting the chunks and
+    # joining them copied the whole frame once more, 0.3 ms at 1280x720.
+    into = getattr(connection, "recv_into", None)
+    buffer = bytearray(count) if into is not None else None
+    view = memoryview(buffer) if buffer is not None else None
     chunks, got = [], 0
     while got < count:
-        chunk = connection.recv(min(1 << 20, count - got))
-        if not chunk:
+        if into is not None:
+            size = into(view[got:], min(1 << 20, count - got))
+        else:
+            chunk = connection.recv(min(1 << 20, count - got))
+            size = len(chunk)
+        if not size:
             if probe_ok and not got:
                 # Connected and closed without a byte: that is `nr-ctl` or `nr-toggle`
                 # asking whether anything is listening. Every status line and every press
@@ -123,9 +132,10 @@ def receive(connection, count, probe_ok=False):
                 # daemon's own log in noise. A truncated frame still reports.
                 return None
             raise EOFError("the layer closed the connection")
-        chunks.append(chunk)
-        got += len(chunk)
-    return b"".join(chunks)
+        if into is None:
+            chunks.append(chunk)
+        got += size
+    return buffer if buffer is not None else b"".join(chunks)
 
 
 SOLID_RADIUS = 3
@@ -141,7 +151,7 @@ class Settings:
     """
 
     KNOBS = ("profile", "intensity", "detail_strength", "colour_strength", "render_scale",
-             "temporal", "cut_limit", "hold")
+             "temporal", "cut_limit", "hold", "release", "min_extent")
 
     def __init__(self, args):
         self.path = args.settings
@@ -197,6 +207,16 @@ class Settings:
                     if not 0.0 <= value <= 1.0:
                         print(f"settings: {knob} must be between 0 and 1", flush=True)
                         continue
+                elif knob == "release":
+                    # levels of 255; 0 is off
+                    if not 0.0 <= value <= 255.0:
+                        print("settings: release must be between 0 and 255", flush=True)
+                        continue
+                elif knob == "min_extent":
+                    # the graph's own floor is 128; above 4096 nothing is left to pad
+                    if not 128.0 <= value <= 4096.0:
+                        print("settings: min_extent must be between 128 and 4096", flush=True)
+                        continue
                 elif not 0.0 <= value <= 2.0:
                     # the vendor's own panel stops at 2 (notes/phase30-control-atlas.md)
                     print(f"settings: {knob} must be between 0 and 2", flush=True)
@@ -229,8 +249,25 @@ def resample(image, size):
         return image
     if (new_height and new_width and height % new_height == 0 and width % new_width == 0
             and height > new_height and width > new_width):
+        # The area mean as NumPy's own `mean((1, 3))` computes it — each block's samples
+        # added one at a time in row-major order, then divided by their count — written as
+        # whole-image adds. Byte-identical to it (test_daemon.py), and 0.5 ms at 640x360
+        # where the multi-axis reduction took 4.8 — 1.9 against 16.5 at 1024x768 — which
+        # every scale of exactly 0.5 paid.
         fy, fx = height // new_height, width // new_width
-        return image.reshape(new_height, fy, new_width, fx, -1).mean((1, 3)).astype(np.float32)
+        if nr_image is not None:
+            # The same adds in C, one pass instead of five: 1.5 -> 0.2 ms at 640x360.
+            native = nr_image.area_mean(image, (fy, fx))
+            if native is not None:
+                return native
+        blocks = np.asarray(image, np.float32).reshape(new_height, fy, new_width, fx, -1)
+        total = blocks[:, 0, :, 0].copy()
+        for dy in range(fy):
+            for dx in range(fx):
+                if dy or dx:
+                    total += blocks[:, dy, :, dx]
+        total /= np.float32(fy * fx)
+        return total
 
     if nr_image is not None:
         # The bilinear branch only: the area mean above is a different filter on purpose,
@@ -392,6 +429,7 @@ class History:
         self.output = None      # (active_h, active_w, 3), what the game last received
         self.source = None      # (inner_h, inner_w, 3), the game's own last frame
         self.pixels = None      # (active_h, active_w, 3), the game's own last frame, whole
+        self.inner = None       # `output` at the network's input extent, taken ahead
         self.frames = 0
         self.cut = 0.0
 
@@ -401,57 +439,42 @@ class History:
         previous, self.cut = self.output, 0.0
         if key != self.key or previous is None or self.source.shape != source.shape:
             self.key, self.output, self.source, self.pixels, self.frames = key, None, None, None, 0
+            self.inner = None
             return None, None, None
         self.cut = float(np.abs(source - self.source).mean())
         if self.cut > limit:
             # A round transition, a replay cut or a menu. The gate rejects wrong history
             # per pixel, but it was characterised at full scale on a pan (phase12); a
             # whole-frame replacement is the one case worth refusing outright.
-            self.output = self.source = self.pixels = None
+            self.output = self.source = self.pixels = self.inner = None
             self.frames = 0
             return None, None, None
-        inner = previous if previous.shape[:2] == source.shape[:2] else resample(previous, source.shape[:2])
+        if self.inner is not None and self.inner.shape[:2] == source.shape[:2]:
+            inner = self.inner
+        else:
+            inner = previous if previous.shape[:2] == source.shape[:2] else resample(previous, source.shape[:2])
         return inner, previous, self.pixels
 
     def keep(self, key, output, source, pixels):
         self.key, self.output, self.source, self.pixels = key, output, source, pixels
         self.frames += 1
+        # The next frame's history at the network's extent, resampled now — the daemon
+        # calls this after the answer has gone, while the game draws its next frame —
+        # instead of on that frame's own path: the same resample of the same array, so the
+        # same bytes. A different extent next time falls back to resampling then.
+        self.inner = (output if output.shape[:2] == source.shape[:2]
+                      else resample(output, source.shape[:2]))
 
 
 # Over how many levels of 255 the hold lets go. A pixel the game handed back unchanged
 # has provably correct history; one level of change is still almost certainly the same
 # surface, and by four it is something else and the model's own gate decides alone.
-HOLD_RAMP = np.float32(4.0)
+HOLD_RAMP = nr_frame.HOLD_RAMP
 
 
-def hold_floor(current, previous, strength):
-    """Per-pixel lower bound on the history weight, from what the *game* did.
-
-    The gate is not local — on a frame where most things move it reads 0.12 even over
-    pixels that did not move at all, against 0.705 when the history was correct
-    everywhere (`notes/phase12-temporal.md`). Motion vectors would fix that, and a
-    `vkQueuePresentKHR` layer has none; optical flow was measured and does not help,
-    because it corrects the history where things *moved*, which is the ghosting case,
-    not the flicker one (`notes/phase54-flicker-fix.md`).
-
-    What the layer does have is the game's own frame. Where it did not change, the
-    previous output is the right answer for that pixel by construction, and holding it
-    cannot ghost: the moment the game moves the pixel the floor is gone. `decode` is a
-    bijection, so comparing the decoded frames is the same test as comparing the bytes,
-    and it stays exact across the packed 10-bit format too.
-    """
-    # Channel by channel and in place. The obvious `max(abs(a - b), axis=2)` builds two
-    # (h, w, 3) temporaries and runs seven full-frame passes at the *output* resolution,
-    # which is where this frame's time already goes (notes/phase47).
-    floor = np.abs(np.subtract(current[..., 0], previous[..., 0], dtype=np.float32))
-    scratch = np.empty_like(floor)
-    for channel in (1, 2):
-        np.subtract(current[..., channel], previous[..., channel], out=scratch)
-        np.maximum(floor, np.abs(scratch, out=scratch), out=floor)
-    # clip(1 - moved * 255 / ramp, 0, 1) * strength, folded into one multiply-add-clip
-    np.multiply(floor, np.float32(-255.0 * strength / HOLD_RAMP), out=floor)
-    np.add(floor, np.float32(strength), out=floor)
-    return np.clip(floor, 0, strength, out=floor)[..., None]
+# The floor's definition lives in nr_frame now, beside the gate it bounds, so that the
+# native composition and the NumPy one read the same thing; kept here by name.
+hold_floor = nr_frame.hold_floor
 
 
 class Meter:
@@ -582,21 +605,26 @@ def process_connection(connection, backend, args):
     if live.render_scale < 1.0:
         inner = resample(colour, (max(64, round(active_height * live.render_scale)),
                                   max(64, round(active_width * live.render_scale))))
-    geometry = nr_frame.NetworkGeometry.vendor_aligned(inner.shape[1], inner.shape[0])
+    geometry = nr_frame.network_geometry(inner.shape[1], inner.shape[0],
+                                         minimum=int(live.min_extent))
     # `inner` is a view of the decoded frame at scale 1; the history keeps it for the next
     # frame's cut test, and aliasing the decode buffer through it has caused two bugs in
     # this function already.
     shot = (width, height, vk_format, top, bottom, left, right, live.profile)
     history_inner, history_full, history_pixels = args.history.take(
         shot, inner, live.cut_limit if live.temporal > 0 else -1.0)
-    features = nr_frame.build_features(inner, geometry=geometry, history=history_inner,
-                                       **nr_frame.PROFILES[live.profile])
+    # Built in the graph's own mapped input where the backend offers it, so nothing is
+    # copied on the way in.
+    input_view = getattr(backend, "input_view", None)
+    features = nr_frame.build_features(
+        inner, geometry=geometry, history=history_inner,
+        out=input_view(geometry.network_height, geometry.network_width) if input_view else None,
+        **nr_frame.PROFILES[live.profile])
     head = geometry.crop(backend.run_features(features))
-    if head.shape[:2] != colour.shape[:2]:
-        # The fourth channel is the temporal gate. Without history it reaches nothing —
-        # carrying it through the upscale would be a quarter of that pass for nothing
-        # (notes/phase48) — and with history it is what decides the blend, per pixel.
-        head = resample(head[..., :4 if history_full is not None else 3], colour.shape[:2])
+    # The fourth channel is the temporal gate. Without history it reaches nothing —
+    # carrying it through the upscale would be a quarter of that pass for nothing
+    # (notes/phase48) — and with history it is what decides the blend, per pixel.
+    channels = 4 if history_full is not None else 3
     control = None
     held = None
     if interface is not None:
@@ -623,52 +651,95 @@ def process_connection(connection, backend, args):
         control[held, 0] = 0.0
     # What the game itself did to each pixel — the only motion signal a present-time
     # layer has, and an exact one.
-    floor = (hold_floor(colour, history_pixels, live.hold)
-             if history_pixels is not None and live.hold > 0 else None)
-    output = nr_frame.compose(head, colour, intensity=live.intensity,
-                              detail_strength=live.detail_strength,
-                              colour_strength=live.colour_strength,
-                              control_mask=control, history=history_full,
-                              history_confidence=live.temporal,
-                              history_floor=floor)
-    # Measure before the write-back: putting the result into `whole` and then differencing
-    # against `whole` compares an array with itself, which reported change 0.00000.
-    changed = float(np.abs(output - colour).mean())
-    if boxed:
-        # A copy, not a write into `whole`: aliasing the input and the output through one
-        # array has now caused two bugs in this function — `change` printed 0.00000, and
-        # a `--dump` saved the composed frame as both the before and the after. One frame
-        # copy is a millisecond against the round's 160.
-        full = whole.copy()
-        full[top:bottom, left:right] = output
-        output = full
-    encoded = encode(output, payload, vk_format)
+    # The floor is computed inside the composition now, from the game's previous frame
+    # (`nr_frame.compose`, `history_previous`); only its share for the log line is taken
+    # here, on every eighth pixel of every eighth row — exactly the values the full floor
+    # has there.
+    previous = (history_pixels if history_pixels is not None
+                and (live.hold > 0 or live.release > 0) else None)
+    # The head's upscale, the composition and the encoder as one pass where the knobs
+    # leave `compose_detail` a no-op: separately they were three passes over the full
+    # frame, ~100 MB of memory traffic at 1280x720 where this moves half, and the bytes
+    # are the same (`nr_frame.compose_encode`, `test_native_image.py`). The answer is
+    # written into the request's own buffer when nothing needs the request's bytes
+    # afterwards — the interface restore does.
+    kind = FORMATS[vk_format][0]
+    fused = None
+    if (kind in ("bgra8", "rgba8") and live.detail_strength == 1 and live.colour_strength == 1
+            and head.shape[0] <= active_height and head.shape[1] <= active_width):
+        answer = (payload if isinstance(payload, bytearray) and held is None
+                  else bytearray(payload))
+        fused = nr_frame.compose_encode(
+            head[..., :channels], colour,
+            np.frombuffer(answer, np.uint8).reshape(height, width, 4),
+            top=top, left=left, bgra=kind == "bgra8", intensity=live.intensity,
+            control_mask=control, history=history_full, history_confidence=live.temporal,
+            history_previous=previous, history_hold=live.hold,
+            history_release=live.release, samples=8)
+    full = None
+    if fused is not None:
+        composed, samples = fused
+        encoded = answer
+    else:
+        if head.shape[:2] != colour.shape[:2]:
+            head = resample(head[..., :channels], colour.shape[:2])
+        samples = head[::8, ::8]
+        composed = nr_frame.compose(head, colour, intensity=live.intensity,
+                                    detail_strength=live.detail_strength,
+                                    colour_strength=live.colour_strength,
+                                    control_mask=control, history=history_full,
+                                    history_confidence=live.temporal,
+                                    history_previous=previous, history_hold=live.hold,
+                                    history_release=live.release)
+        if boxed:
+            # A copy, not a write into `whole`: aliasing the input and the output through
+            # one array has now caused two bugs in this function — `change` printed
+            # 0.00000, and a `--dump` saved the composed frame as both the before and the
+            # after. One frame copy is a millisecond against the round's 160.
+            full = whole.copy()
+            full[top:bottom, left:right] = composed
+        encoded = encode(full if full is not None else composed, payload, vk_format)
+    # Measure the composition itself, not what the write-back makes of it: putting the
+    # result into `whole` and then differencing against `whole` compares an array with
+    # itself, which reported change 0.00000. On every fourth row, like the log's other
+    # figures: the whole frame took 5 ms of a 1080p frame for a number printed to five
+    # places, and a quarter of the rows moves it by about a part in five hundred. Taken
+    # after the answer has gone where nothing writes into `composed` before then.
+    changed = None
     if held is not None:
+        if full is None:
+            # the restore below writes into the composition itself
+            changed = float(np.abs(composed[::4] - colour[::4]).mean())
         # The control mask reaches `compose_head`, but `compose_detail` runs *after* it
         # and re-weights the whole frame: with either strength away from 1 it moved 89.6%
         # of the masked pixels, so the interface protection silently stopped working the
         # moment a knob was touched. Restoring the original wire bytes here is exact by
         # construction — it survives every later stage and does not depend on the codec
         # round-tripping. Taken from the parallel ProjectsCodex tree, which had it.
-        protected = np.frombuffer(encoded, np.uint8).copy().reshape(height, width, 4)
+        in_place = isinstance(encoded, bytearray)
+        protected = np.frombuffer(encoded, np.uint8)
+        protected = (protected if in_place else protected.copy()).reshape(height, width, 4)
         original = np.frombuffer(payload, np.uint8).reshape(height, width, 4)
         if boxed:
             protected[top:bottom, left:right][held] = original[top:bottom, left:right][held]
         else:
             protected[held] = original[held]
-        encoded = protected.tobytes()
-        if boxed:
-            output[top:bottom, left:right][held] = colour[held]
-        else:
-            output[held] = colour[held]          # so a --dump shows what was actually sent
+        if not in_place:
+            encoded = protected.tobytes()
+        # so a --dump shows what was actually sent
+        (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
     connection.sendall(encoded)
-    # After the interface restore, so what is carried forward is what the game was
-    # actually handed. A copy: `output[top:bottom, left:right]` is a view of the frame
-    # buffer that the next decode overwrites.
+    if changed is None:
+        changed = float(np.abs(composed[::4] - colour[::4]).mean())
+    # What the game was handed at the active region: after the interface restore, so what
+    # is carried forward is what the game actually received.
+    active = full[top:bottom, left:right] if full is not None else composed
     if live.temporal > 0:
-        args.history.keep(shot,
-                          np.array(output[top:bottom, left:right] if boxed else output),
-                          np.array(inner), np.array(colour))
+        # Kept as they are, not copied: each is this frame's own — decode, the resample and
+        # the composition all hand back fresh arrays, nothing writes them from here on, and
+        # History only reads what it holds. Three frame copies a frame were 0.4 ms at
+        # 640x360 and 2-3 at 1280x720.
+        args.history.keep(shot, active, inner, colour)
     if args.dump:
         import image_io
         try:
@@ -678,20 +749,30 @@ def process_connection(connection, backend, args):
             # keeps every shot instead of overwriting the last one.
             index = 1 + max((int(path.stem.split("_")[0]) for path in destination.glob("*_in.png")
                              if path.stem.split("_")[0].isdigit()), default=0)
+            shown = full
+            if shown is None and boxed:
+                shown = whole.copy()
+                shown[top:bottom, left:right] = active
             image_io.save(whole, destination / f"{index:03d}_in.png")
-            image_io.save(output, destination / f"{index:03d}_out.png")
+            image_io.save(shown if shown is not None else active,
+                          destination / f"{index:03d}_out.png")
             print(f"  -> {destination}/{index:03d}_{{in,out}}.png", flush=True)
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
             print(f"frame returned, but dump failed: {error}", flush=True)
     if args.meter is not None:
-        args.meter.add(colour, output[top:bottom, left:right] if boxed else output)
+        args.meter.add(colour, active)
     note = "" if held is None else f"  interface {100 * held.mean():.0f}% left alone"
     if live.temporal > 0:
         if history_full is None:
             note += f"  no history, cut {args.history.cut:.4f}"
         else:
-            gate = float(nr_frame.history_weight(head[::8, ::8]).mean())
-            hold = "" if floor is None else f", held {100 * float((floor[::8, ::8] > 0).mean()):.0f}%"
+            gate = float(nr_frame.history_weight(samples).mean())
+            hold = "" if previous is None else (
+                f", held {100 * float((hold_floor(colour[::8, ::8], previous[::8, ::8], live.hold) > 0).mean()):.0f}%")
+            if previous is not None and live.release > 0:
+                kept = nr_frame.release_factor(colour[::8, ::8], previous[::8, ::8],
+                                               nr_frame.release_slope(live.release))
+                hold += f", released {100 * float((kept == 0).mean()):.0f}%"
             note += f"  gate {gate:.3f}{hold}, cut {args.history.cut:.4f}"
     box = "" if not boxed else (f"  letterbox {height - (bottom - top)}px of rows and "
                                f"{width - (right - left)}px of columns skipped")
@@ -702,7 +783,9 @@ def process_connection(connection, backend, args):
     split = f"  gpu {1000 * carried:.0f}+{1000 * ran:.0f}+{1000 * read:.0f}ms" if ran else ""
     print(f"{width}x{height} {FORMATS[vk_format][1]} in "
           f"{time.perf_counter() - clock:.2f}s  "
-          f"change {changed:.5f}{note}{split}{box}", flush=True)
+          f"change {changed:.5f}{note}{split}{box}"
+          f"  network {geometry.network_width}x{geometry.network_height}"
+          f" scale {live.render_scale:g}", flush=True)
     if args.meter is not None:
         print(args.meter.report(), flush=True)
 
@@ -727,6 +810,12 @@ def main():
     parser.add_argument("--hold", type=float, default=1.0,
                         help="how hard to hold pixels the game handed back unchanged, "
                              "0-1; this is the floor under the model's own gate")
+    parser.add_argument("--release", type=float, default=24.0,
+                        help="levels of 255 of change in the game's own pixel by which none "
+                             "of the model's history gate survives there, 0-255; 0 is off")
+    parser.add_argument("--min-extent", type=float, default=320.0,
+                        help="the smallest side the network's frame is padded to, 128-4096; "
+                             "320 is what NVIDIA's own driver does, the graph runs down to 128")
     parser.add_argument("--cut-limit", type=float, default=0.15,
                         help="mean absolute frame-to-frame change above which the shot is "
                              "taken to have cut and the history is dropped")
@@ -746,6 +835,10 @@ def main():
     for knob in ("temporal", "cut_limit", "hold"):
         if not 0.0 <= getattr(args, knob) <= 1.0:
             parser.error(f"--{knob.replace('_', '-')} must be between 0 and 1")
+    if not 0.0 <= args.release <= 255.0:
+        parser.error("--release must be between 0 and 255")
+    if not 128.0 <= args.min_extent <= 4096.0:
+        parser.error("--min-extent must be between 128 and 4096")
     args.live = Settings(args)
     args.history = History()
     args.letterbox = Letterbox()
@@ -764,6 +857,25 @@ def main():
     print(f"model ready in {time.perf_counter() - started:.1f}s"
           f" on {xmx.device_name()}", flush=True)
     print(f"buffers in {xmx.memory_note()}", flush=True)
+    print(f"gemm on {xmx.path_note()}", flush=True)
+    rt = backend.runtime
+    print("runtime options " + " ".join(
+        f"{name}={int(getattr(rt, attr))}" for name, attr in (
+            ("NR_BATCH_FFN", "batch_ffn"), ("NR_FUSE_QK", "fuse_qk"),
+            ("NR_JOINT_QKV", "joint_qkv"), ("NR_INPUT_FP16", "input_fp16"),
+            ("NR_COMPACT_HEAD", "compact_head"), ("NR_FUSE_RESIDUAL", "fuse_residual"),
+            ("NR_FUSE_WINDOW_RESIDUAL", "fuse_window_residual"),
+            ("NR_FUSE_WINDOW_ATTENTION", "fuse_window_attention"),
+            ("NR_FUSE_ATTENTION_MERGE", "fuse_attention_merge"),
+            ("NR_QKV_EPILOGUE", "qkv_epilogue"), ("NR_FUSE_GLUE", "fuse_glue"),
+            ("NR_FUSE_FFN", "fuse_ffn"), ("NR_FUSE_BRANCHED_FFN", "fuse_branched_ffn"),
+            ("NR_FUSE_PARTITION", "fuse_partition"),
+            ("NR_FUSE_TRANSITION", "fuse_transition"),
+            ("NR_FUSE_MERGE_FFN", "fuse_merge_ffn"), ("NR_FUSE_STEM_FFN", "fuse_stem_ffn"),
+            ("NR_FUSE_POOL", "fuse_pool"), ("NR_FUSE_WINDOW_BLOCK", "fuse_window_block"),
+            ("NR_FUSE_HEAD", "fuse_head"),
+            ("NR_FUSE_GLOBAL_ATTENTION", "fuse_global_attention"))),
+          flush=True)
 
     if os.path.lexists(args.socket):
         if not stat.S_ISSOCK(os.lstat(args.socket).st_mode):

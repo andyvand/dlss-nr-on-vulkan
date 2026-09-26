@@ -1,6 +1,6 @@
 # HANDOFF — read this first
 
-State of the DLSS-NR on Intel Xe2 project as of **2026-09-11**. notes/CLAUDE.md holds the
+State of the DLSS-NR on Intel Xe2 project as of **2026-09-26**. notes/CLAUDE.md holds the
 original brief; **this file overrides it wherever they disagree**, and after
 2026-09-09 they disagree about something foundational.
 
@@ -9,7 +9,1061 @@ you need the evidence behind a line in this file, rather than reading them in or
 
 ---
 
-## Latest: the present has a test, and `NR_LAYER_SYNC=semaphore` (2026-09-19, later)
+## Latest: 45 more dlss-nr-on-intel commits, on every runtime, and speedups (2026-09-26, night)
+
+`d0fb63c`..`f478901` of `uzbekunknown/dlss-nr-on-intel` are in (merged file by file against
+`2f23eff`): `min_extent`, the small-bottleneck pads and the 32-row staged builds, the whole-row
+softmax, `UPSAMPLE_ADD` and `POOL2_SKIP`, block 0's stem and pool and block 70's merge and
+head made inside their neighbours, the one-head window block, the global attention in one
+pass, the half bottleneck chain, the scratch sized by discovery, the fused composition
+vectorised, the integer staged GEMM (a measurement, not in the graph), and their notes
+(`improve-b.md`). Carried past them:
+
+- **Portable Vulkan twins**, each equal to *this path's* unfused passes bit for bit:
+  `window_block_portable.comp` (eight 32-lane slices, 28.25 KB), `global_attention_portable.comp`
+  (24.25 KB), merge and stem in `ffn_fused_portable.comp` (the lane's A made once into
+  registers), the pooled window residual in the 16x32 `gemm_portable` build, and
+  `gemm_staged_int8_portable.comp` (bytes read as words: no int8 features needed). libxmx
+  enables the int8 features only where the device has them, builds the staged32 builds only
+  where the staged kernel exists, and routes the pool to the portable 16x32 block;
+  `xmx_window_gather()` now also gates `NR_FUSE_POOL`. **Trap:** MoltenVK contracts the
+  portable GEMM's `branch + skip * cosine` into an FMA, and the same expression inline in a twin
+  was contracted differently — a quarter of the window block's outputs an ulp off — so the
+  Vulkan twins write `fma()` explicitly, as upstream's matrix kernels do.
+- **Metal**: every entry point on both paths (`gemm_staged` a template for the 32-row builds,
+  `attention_rows`, `window_block[_portable]`, `global_attention[_portable]`, one exact
+  `gemm_staged_int8`). Metal compiles with contraction off, so its twins keep the plain
+  expression. Two routing differences from libxmx, from Metal's staging threshold of 128: the
+  32-row builds and the pool take K from 32.
+- **Direct3D 12**: every entry point, portable only (u6/u7 as the 64-bit address slots,
+  `OPERANDS` 8). Its twins keep `branch + skip * cosine`, as its own reference passes do —
+  whether the driver contracts both alike is what the first Windows run must check.
+  Compiled (17 DXIL modules) and cross-linked with MinGW, 78 exports; **not run**.
+- **The C frame library** records the new graph call for call — the seven new `NR_FUSE_*`
+  switches and their predicates, the half chain, the pads — sizes its scratch by a dry
+  recording as `ScratchArena.discover` does (**1280x720: 2170 -> 699 MiB** with the weights),
+  gains `nr_frame_params.min_extent` (appended; default 320, rebuild hosts) and
+  `nr_frame_compose_encode()` (the daemon's head upscale, composition and encode in one pass).
+  Bit-identical to the Python head on MoltenVK and Metal in twelve switch configurations.
+
+**Speedups, all byte-identical, no API change:**
+- Vulkan portable (MoltenVK): 8-byte operand fetches, a 16x64 `gemm_portable_wide` build for
+  N % 64 == 0, and N = 32/96 GEMMs on the 8x16 kernel unless a 32-column block is required
+  (`XMX_PORTABLE_WIDE=0`, `XMX_PORTABLE_TILED=1` restore): **1280x768 927 -> ~670 ms, 320x320
+  167 -> 120**.
+- Metal portable: the 8-byte fetches, **1280x768 561 -> 469 ms, 320x320 94 -> 69**; the other
+  two lost on Metal and are opt-in there (`XMX_PORTABLE_TILED=0`, `XMX_PORTABLE_WIDE=1`).
+  Metal simdgroup, from the ported fusions themselves: **1280x768 391 -> 346 ms**.
+- Direct3D 12: the same three as Vulkan; not measured.
+- Host: `compose_encode_row` split so clang vectorises it (the table gather kept it scalar on
+  ARM): 1080p fused composition **4.8 -> 2.4 ms** on 8 threads; `compose_detail` and the
+  control-mask loop on the row pool; the compact head's crop a row at a time. The row pool now
+  hands out four rows at a time (upstream's `schedule(dynamic, 4)`), except the per-pixel and
+  per-element loops.
+
+**Metal 4, with Metal 3.1 as the fallback.** A second embedded metallib,
+`nr_shaders4.metallib` (`-std=metal4.0 -DNR_METAL4`, built only when the SDK's compiler takes
+it; `-DNR_METAL4=OFF` / `METAL4=0`), where the resident, tiled, staged and 32-row staged GEMMs
+hand their K loop to MetalPerformancePrimitives' `matmul2d`; blocks, stage and epilogues
+unchanged. libmetalmx takes it on the simdgroup path when macOS 26+ reports Metal 4 and
+neither `XMX_METAL4=0` nor `XMX_METALLIB` is set, else loads the 3.1 library exactly as
+before (macOS 11 deployment target, no warnings); `xmx_path()` names it. `matmul2d` gives the
+same bits as the simdgroup kernels' K order on every shape tried on the M3, so **both
+libraries render the same bytes** and the fused kernels, which keep their own loops, still
+equal their unfused passes. **1280x768 346 -> 212 ms, 320x320 52 -> 32 ms.**
+If a future Apple GPU's `matmul2d` sums in another order, the fused-vs-unfused tests on the
+Metal 4 library are what will say so.
+
+**Metal, round 3 (2026-09-26, later): 212 -> 202 ms replayed at 1280x768 on the Metal 4
+library, 31.6 -> 30.3 at 320x320; 346.6 -> 341.9 on the 3.1 library; portable unchanged.**
+Device totals from `frame_profile.py`: 209.5 -> 199.1 ms (Metal 4), 343.9 -> 337.2 (3.1).
+Every head hash unchanged on all three paths; kept, each paired against the old kernel:
+- the fused feed-forward's two products on `matmul2d` in the Metal 4 build, the projection
+  accumulating across the hidden chunks in a register tensor (multiply-accumulate mode) and
+  the gated expand written from registers through `get_multidimensional_index`, the made
+  input (merge, stem) in the stage's second kilobyte: 1.92 -> 1.67 ms (narrow), 7.76 -> 6.97
+  (merge), 7.61 -> 6.90 (stem) — the frame's FFN 30.4 -> 27.0 ms;
+- the window block's Q/K cosine four lanes a row with shuffles (the tree's own layout, as
+  window_block.comp does it), K stored transposed as each lane's 16-byte store so QK^T loads
+  plain tiles, and the row gather as 4-wide loads: 9.15 -> 8.19 ms a call, 37.8 -> 33.9 a
+  frame, both libraries;
+- window attention's K transposed on its way in: 4.40 -> 4.28 ms;
+- the window-gathered QKV projections (~43 ms of a frame): the row bases found once rather
+  than every K step (both libraries), and on Metal 4 the gathered tile double-buffered in
+  the stage's bytes, one barrier a step: 5-10 % on each.
+Measured and dropped: `matmul2d` for the window block's 8-row products (no change — its
+tiles are too small for the operand pipeline to matter), QKV weights staged in threadgroup
+memory (none), vector loads of the denominator chains (none), a half-typed expand result as
+the projection's register left input (same bits, no faster), a 64-deep K step for the
+gathers (10 % slower), 16x64 and 32x32 tiled builds for the shallow GEMMs (1 % on Metal 4 in
+steady state, slower on 3.1 — single-call timings had said 25 %: time 10-20 calls a
+submission), N = 32 GEMMs on the tiled kernel (noise), the QKV epilogue four lanes a row in
+the GEMMs (no change), chunked commits of a replayed frame (encoding is ~1 ms and hidden),
+vector loads in the portable kernels (slower: the compiler already combines them), and the
+global attention's keys transposed (noise). What is left: the staged GEMMs are ~3.0 TFLOP/s
+against a measured 3.2 peak; the fused kernels run ~2 TFLOP/s of mostly element-wise work.
+
+**Metal 4 and the C library, round 4: nothing more worth keeping, measured.** The C library
+on Metal 4 is the GPU: `nr_frame_rates --pan 4` gives 640x360@0.5 31 ms (network 30.3, host
+0.9), 1280x720@0.35 40 ms (38.0 + 2.2), 1920x1080@0.3 61 ms (56.4 + 4.5), and the input and
+output transfers are 0.0 ms on shared memory — so a C API speedup there has to be a graph
+change, and the history rules out overlapping frames. At the live extent (320x320, 29.9 ms of
+device time) the staged GEMMs are 19.2 ms, the bottleneck's 64-row shapes at 2.3-2.8 TFLOP/s;
+routing 64-row GEMMs with N up to 4096 to the 32-row build was within noise (186-211 us
+either way, same bytes). A pass with its barrier costs ~3.7 us (400 empty passes: 1.6 ms),
+~1.5 ms of the frame, and the barriers are real dependencies. Also host round 2: `nr_compose` and
+`nr_compose_temporal` split like `compose_encode_row` (720p temporal with release 1.45 ->
+0.81 ms on 8 threads); an async frame API was considered and not built (the history makes
+frame N+1 wait on frame N's composition; host work is under 1 % of a frame now).
+
+Verified on the M3: the kernel tests bit-exact on Vulkan-portable, Metal-simdgroup and
+Metal-portable, mapped and `XMX_STAGING=1`; frame heads unchanged with each new switch off, at
+320x320 and at the 16/32-token extents `min_extent` reaches; ctest 70 of 71, the one failure
+`publish_check` on the committed `weights/*.h`, as before.
+No Xe2, phone or Windows run: the matrix-path GLSL is upstream's.
+
+## Planned, not started
+
+- **Motion vectors from the game's own upscaler.** A layer at `vkQueuePresentKHR` sees the
+  finished frame and nothing else, which is why the temporal path reprojects by identity and
+  needs `release` against trails. Every game with DLSS, FSR 2+ or XeSS hands its upscaler the
+  render-size colour, motion vectors, depth and jitter, and OptiScaler already intercepts
+  exactly those calls under Proton; `Dagherbou/OptiScaler_DLSSNR` runs NVIDIA's own model
+  there, before the interface is drawn, in six one-line call sites. Our version would send
+  those resources to the daemon instead. It would give real reprojection, no interface in the
+  input, and the network at render size before the upscale, as the vendor arranges it.
+  Estimated 2-3 weeks (a Windows build of OptiScaler from here, transport out of Wine, each
+  game's motion-vector convention); deferred by the owner on 2026-09-26. Tekken 7 and DoA5
+  have no upscaler, so it needs a newer game.
+- **A FAQ** in the README, for the questions that keep coming back. Later.
+
+## The bottleneck's attention in one pass, and a bug under `min_extent` (2026-09-26, evening)
+
+**A bug, fixed in `bb9cadf`: with `min_extent` below 320 the bottleneck's attention was
+wrong from 2026-09-25 23:10 (`7fd27ea`) until now.** That commit padded a bottleneck of 32
+tokens or fewer to 32 rows. At 16 tokens — every network from 128x128 to 256x192, so 640x360
+at 0.35 and 512x288 at 0.35 in the table below — the softmax then ran on `softmax_rows`,
+which keeps one reciprocal a row in the last 32 floats of its stage but took `2016 / (stride
++ 1)` rows a workgroup: 61 at a stride of 32, and rows 32-60 of each read a reciprocal from
+past the stage and came out zero. Capped at 32 rows; the 32-row pad now gives the 64-row
+pad's head bit for bit. The default, 320, never reached it, and the `min_extent` pictures
+below were taken before it existed — **an in-game comparison made since then saw the bug
+and needs redoing.** `7fd27ea` was checked by comparing the GEMM routing with the pad at 32
+on both sides: a comparison that holds the change constant proves nothing about the change.
+It surfaced because the fused kernel below disagreed with its reference at 17 tokens on 32
+rows, and the reference was the one that was wrong.
+
+**The global blocks' attention in one pass** (`global_attention.comp`,
+`NR_FUSE_GLOBAL_ATTENTION`): QK^T, the softmax, PV and the head merge, no score stored. A
+workgroup takes one head and 64 query rows, the keys go through shared memory twice — the
+first time each row's lane adds its weights in key order, the softmax's own order, for the
+reciprocal; the second the probabilities are made as the softmax publishes them and
+multiplied into V over the PV GEMM's own K steps. Sixteen keys at a time inside a block: all
+64 at once spilled 30 registers and ran 1.3 ms a call at 640 tokens, against 0.9.
+Bit-identical — 32 cases in both memory modes, frame heads, graph hashes, the daemon's
+answers — and `make test` green in both modes. **1920x1088 281.6 -> 267.7 ms** of replayed
+graph (the pass 20.0 -> 6.9 ms), 1280x768 134.0 -> 132.9; nothing at the live sizes, where
+the bottleneck is 64-96 tokens.
+
+**The scratch sized by what the recording touches** (`3ace454`). The arena sized each role
+by every buffer planned in it, used or not, and with the fused paths on the largest are
+never touched: the window blocks' float32 scores and half probabilities, the float32 QKV
+projection, the attention buffers of the 32-channel levels that run whole in
+`window_block.comp`. `ScratchArena.discover()` records the frame once with a stand-in
+address a role, never runs it, and shrinks each role to what that recording touched.
+**Resident, weights included: 320x320 413 -> 328 MiB, 1280x768 1510 -> 701, 1920x1088 2885
+-> 1164.** Bit-identical, `make test` green in both memory modes. The plan belongs to the
+switches and the capture mode (a capture keeps block 0's stem): changing either plans again
+and drops the graphs made against the old plan; a new specialisation does not. The
+discovery costs 15-45 ms once per extent. Whether Mortal Kombat 1 now fits at full render
+scale (`phase62`: OOM-killed at 1.0) is the owner's to try.
+
+**The bottleneck chain in half** (`a9ffc8a`, under `NR_FUSE_GLUE`): the eight global blocks
+run in their scratch's own half value, published E4M3 between them, instead of widening it
+to float32 and narrowing it again — 32 conversion passes a frame gone, bit-identical. The
+output projection stores the real rows only: the pad rows must stay zero, because an odd
+token count takes the first pad row's key into the softmax's sum. Small — 0.75-0.9 ms of
+device time at 320x320 with per-pass timestamps, within noise replayed.
+
+**The fused composition vectorised** (`2176f64`, host side): `nr_compose_encode` was all
+arithmetic — 22.7 ms of one core at 1080p, one pixel at a time — because of the runtime
+strides, the `_Float16` conversions (no vector half arithmetic on this CPU) and the clamps,
+which default `-ftrapping-math` will not turn into selects. In the daemon's layout each row
+now runs one constant-stride loop per knob combination, with the half rounding done in
+integer and float arithmetic that matches the hardware on all 2^32 floats: one core 22.7 ->
+12.4 ms, eight 4.4 -> 3.2, bytes unchanged. What is left there is memory: ~110 MB a 1080p
+frame, the colour and the game's previous frame read as float32. Reading them as the bytes
+they arrived as would take ~35 MB off and the decode with it — a refactor of the daemon's
+data flow, not done.
+
+Measured on the way and left: the window block (`window_block.comp`) is not memory-bound. At
+1920x1088 its three phases take 5.8 ms up to K and V in shared memory, 5.5 for the attention
+and 1.6 for the projection and the store, of 12.9; the attention phase has no spills (the 4
+the kernel has are in its tail), and the whole runs ~2.7 TFLOP/s of multiply-adds, the rest
+of its time the element-wise work — cosine trees, E4M3 publishes, the weights' transform — a
+window's 256 multiply-adds a subgroup cannot hide. A two-head version for level 2 would move
+its three memory-bound passes (2.4 ms a block at 1080p, at the bandwidth ceiling) onto that
+same ~2.7 TFLOP/s, and win nothing.
+
+## The one-head blocks' attention in one pass a window (2026-09-26, afternoon)
+
+Blocks 0 and 70 and the eight at half resolution — 32 channels, one head — ran their
+attention half as three passes, and between them Q, K and V (12 KB a window) and the
+attention's output (4 KB) went to memory and back: 22 % of the graph at 320x320, ~24 % at
+1280x768. `window_block.comp` keeps them in the workgroup: eight subgroups, a window row
+each, project, keep Q in registers and K and V in shared memory, run the attention as
+`window_attention.comp` does and finish with the output projection and the residual — block
+0's with its 2x2 pool (`NR_FUSE_WINDOW_BLOCK`). Bit-identical, 272 cases against the three
+passes; frame heads, the daemon's answers and `make test` in both memory modes unchanged.
+
+**The first version was slower than the three passes (0.85-0.98x)**, and two ablations
+found why. The QKV epilogue's normalisation ran a row a lane — 8 of 32 lanes in every
+subgroup; spread over four lanes a row, the way the vendor's cosine tree is laid out, with
+the butterflies as shuffles and the same operations on the same operands, it went 10.9 ->
+7.1 ms at 1280x768. And the weights' B fragments read from memory by row cost 1.6 ms; staged
+in shared memory — in K's and V's bytes before they are written, in K's after QK^T — 7.1 ->
+6.2. Reading them by column from transposed copies was slower (10.8).
+
+1.44-1.50x the three passes. Replayed graph **320x320 25.2 -> 23.7 ms, 1280x768 146.2 ->
+134.9, 1920x1088 307.1 -> 283.7**; the daemon 640x360 at 0.5 27.7 -> 26.0 ms, 1280x720 at 0.35
+35.4 -> 33.1. README table re-measured (medians of three): **640x360 at 0.5 31.8 -> 26.8 ms,
+1024x768 at 0.55 60.1 -> 50.8, 1920x1080 at 0.55 140.5 -> 117.6**. The wider blocks keep
+three passes: at C = 512 a window's Q, K and V are 192 KB.
+
+Then **block 70's head inside its window block** (`NR_FUSE_HEAD`): its output, read only by
+the head, is never stored — 7.05 -> 6.50 ms for the pair at 1280x768, 63-133 MB less memory
+at 720p-1080p. Measured and not kept, in `notes/improve-b.md`: the staged GEMM's B staged as
+pairs of K (Mesa's fragment layout probed; half the loads and 5-7 % slower), a level-1
+block's feed-forward inside its window block (no faster: each window reloads the 16 KB of
+weights ffn_fused shares among 256 rows), and the fused branched feed-forward re-measured
+(slower at every extent, 1920x1088 +14.5 ms). What is left inside the graph at 320x320:
+GEMM two-thirds of it, at the staged kernel's ~3.5-3.8 TFLOP/s on the large shapes; the
+window blocks 12 %. And the bottleneck's QKV projection at 96 tokens — 1920x1080 at 0.3 —
+left the tiled kernel once the QKV epilogue could skip a partial block's rows (0.255 ->
+0.166 ms a call; the daemon there 49.3 -> 48.5 ms). At high extents the next lever is the
+global attention in one kernel (`notes/improve-b.md`, 7 % at 1920x1088, not written).
+
+## int8 on the bottleneck: measured again, and kept as a measurement (2026-09-26)
+
+With the activations on int8 too — config 4's real input, per row — blocks 31-38 cost 5.0 %
+of the effect at 1080p and 6.7 % at 720p, and **9-13 % at the live extent** (a 320x180
+frame on a 320x320 network), the most where speed matters most. The kernel exists and is
+exact (`gemm_staged_int8.comp`, 1.42-1.51x on the bottleneck's GEMMs): about 5 % of the
+graph at 320x320, 2 % at 1280x768, before quantising the activations. **Not in the graph,
+by the owner's decision**: a twentieth of the speed for a tenth of the effect.
+`notes/improve-int8-bottleneck.md`.
+
+## Three full-resolution intermediates never stored (2026-09-26, morning)
+
+Around the two full-resolution blocks, three values were written out only for the next
+pass to read them back, and in two cases written twice, as float32 and as half. Each is
+now made where it is used; all bit-identical (`test_glue.py`, frame heads, the daemon's
+answers at three live sizes, `make test` in both memory modes), each behind a switch:
+
+- **block 70's input made inside its feed-forward** (`NR_FUSE_MERGE_FFN`): the last
+  upsample merge, 0.78 -> 0.50 ms for the pair at 320x320, 6.67 -> 4.28 at 1280x768;
+- **block 0's stem made inside its feed-forward** (`NR_FUSE_STEM_FFN`): the stem GEMM's one
+  K step, done again in the kernel that read its two outputs — 5.83 -> 3.48 ms at 1280x768,
+  and the feed-forward that makes its stem is no slower than the one that read it;
+- **block 0's output pooled and published in its window residual's epilogue**
+  (`NR_FUSE_POOL`): a staged block is one 8x8 window across all 32 channels, so the pool is
+  summed from the stage — 5.27 -> 2.51 ms at 1280x768;
+- and the 64-token bottleneck's two N = 1024 GEMMs on 32-row blocks (0.18 ms at 320x320).
+
+Graph 1280x768 153.7 -> ~145.5 ms, 1920x1088 321.6 -> ~305. The daemon against
+`improve-int8`, everything since last night included (medians of three): **640x360 at 0.5
+28.8 -> 26.6 ms, 1280x720 at 0.35 36.5 -> 34.8, 1920x1080 at 0.3 57.0 -> 53.4**.
+
+**A trap from the first one.** The residual `branch + skip * cos` compiles to one fused
+multiply-add inside `add_gemm_residual`; written inline in the new epilogue, the same
+expression came out as a multiply and an add, and a sixth of the outputs moved by an ulp.
+`test_glue.py` caught it. The epilogue now writes `fma()` under `precise`, which pins the
+rounding instead of leaving it to the compiler's contraction.
+
+## Four passes of the graph, faster (2026-09-26, night)
+
+All bit-identical — frame heads, the daemon's answers at three live sizes, `make test` in
+both memory modes — and each its own commit on `improve-b`:
+
+- **a decoder transition's upsample, scaled skip and add in one pass** (`UPSAMPLE_ADD`,
+  `NR_FUSE_TRANSITION`): three passes, two writing float32 for the next to read back;
+- **the global blocks' softmax on whole rows in shared memory, on 256 lanes**
+  (`attention_rows.spv`): one row a lane had read the bottleneck's scores as a gather
+  through L2, twice, on a pass holding a quarter of a core's threads — 0.573 -> 0.223 ms a
+  call at 1280x768, and 1920x1088's graph 344 -> 329.5 ms;
+- **block 0's output pooled and published as the skip in one read** (`POOL2_SKIP`, under
+  `NR_FUSE_GLUE`);
+- **window attention's denominators summed by two subgroups, a lane a row**: each subgroup
+  summing its own eight rows kept 8 of 32 lanes busy on a 64-add chain — a fifth of the
+  pass. The order of every sum is unchanged.
+
+The daemon, time to the answer against `improve-int8` (medians of three): **640x360 at 0.5
+29.1 -> 27.8 ms, 1280x720 at 0.35 37.0 -> 36.1, 1920x1080 at 0.3 56.7 -> 54.75**. Tried and
+not kept, in `notes/improve-b.md`: Q, K and V as E4M3 bytes (half the traffic, both passes
+slower — they were not waiting on it). Measured and left: the narrow blocks' fused
+feed-forward at 1280x768 moves ~315 MB in 3.5 ms, at the ceiling; what would pay there is
+reading its input once instead of as both half and float32, which needs its shared memory
+rearranged (~2 % at 720p).
+
+## The frame around the network, faster at 720p and up (2026-09-26)
+
+On the daemon's own path, answers and log lines byte-identical, time to the answer (median of
+three alternating runs): **1280x720 at 0.35 41.6 -> 36.8 ms, 1920x1080 at 0.3 60.8 -> 56.8**;
+640x360 at 0.5 within noise, where the graph is 26.2 of ~29.5 ms. Three changes:
+
+- the head's upscale, the composition and the encoder in **one native pass**
+  (`nr_compose_encode`) wherever `compose_detail` is a no-op — three full-frame passes and
+  ~100 MB of memory traffic at 1280x720 became one and half of it;
+- rows handed to OpenMP threads **four at a time as they come free**: four of the eight cores
+  are low-power ones, and an even split left the others waiting (the fused pass 2.6 -> 2.2 ms);
+- what only the log and the next frame need, done **after the answer is sent**.
+
+Also merged from `improve-b`: a 32-row staged block for a bottleneck of 32 tokens or fewer,
+which only `min_extent` below 320 reaches (0.7-1.2 ms at 192x128-320x192). What was tried on
+the graph and did not pay — a small-M kernel, E4M3 weights, swapped operands, other block
+shapes — is in `notes/improve-b.md`; at 320x320 what is left inside the graph is about a
+percent an item.
+
+## The 320 floor is NVIDIA's, not the network's — `min_extent` (2026-09-25, night)
+
+The network's frame is padded by mirroring to at least 320 a side because that is what the
+vendor's driver does (`NetworkGeometry.vendor_aligned`, recovered by MLX-DLSS). The graph
+itself runs down to **128** — MLX-DLSS's own graph contract, a window of 8 at a sixteenth
+of the extent. At live sizes most of a 320x320 frame was mirror padding: 44 % of it at
+640x360 and scale 0.5, 82 % at 512x288 and 0.35. On the daemon's path, one DoA5 frame:
+
+| game size, scale | network at 320 | network at 128 | ms a frame |
+| --- | --- | --- | --- |
+| 640x360, 0.5 | 320x320 | 320x192 | 30.3 -> 22.7 |
+| 640x360, 0.35 | 320x320 | 256x128 | 29.4 -> 16.1 |
+| 512x288, 0.35 | 320x320 | 192x128 | 28.6 -> 14.7 |
+
+**The picture is different, not broken**: the two answers differ by 4-6 levels of 255 on
+average — as much as the pass changes the frame — with no artefacts at 192x128; at 320x192
+the effect came out stronger (7.2 against 4.6 levels of change), at 192x128 slightly softer.
+Which is better is taste, so it is a knob: `min_extent`, 128-320 in steps of 64, **default
+320**, unchanged behaviour. The owner is to compare in a game.
+
+At those small frames the bottleneck is 16 or 32 tokens, and it is now padded to 64 rows
+outright (to 32 at 32 tokens or fewer since `7fd27ea` — see the bug above): its GEMMs wait on the K loop, not on rows, and a whole block moves the QKV
+projection's epilogue off the tiled kernel (0.22 -> 0.14 ms a call, ~0.6 ms of a 192x128
+frame, bit-identical). What is left there is the staged kernel's K loop itself: even with
+every global load taken out, a 32-deep step costs ~0.93 us of shared-memory stores,
+barriers and fragment loads, and at 16-64 rows nothing hides it. A small-M kernel without
+the shared-memory round trip, with weights stored in the fragment order a B tile loads in,
+is the next idea there — not tried.
+
+And on screenshots: a light blur of the network's *input* at 1.0 ([1 2 1] each way, the
+frame composed over the untouched original) takes the pixel-level share of what the pass
+adds from 2.8 % to 0.9 % — 0.9's figure — but not its strength (change 0.024 against 0.039
+at 0.9). The grain comes from the game's aliasing; the strength comes from the smaller
+frame. 0.9 gives both, so there is no pre-filter knob.
+
+## Six more dlss-nr-on-intel commits, on every runtime (2026-09-25, night)
+
+`bd9e13a`..`2f23eff` of `uzbekunknown/dlss-nr-on-intel` are in: the README's I/O paragraph,
+the `release` knob, render scale 0.9 for screenshots (`src/bench/scale_spectrum.py`), the async
+live mode and its two HANDOFF entries (next sections). Carried past them:
+
+- **`release` is in the C frame library.** `nr_frame_params` has a `release` field after
+  `slope`, folded the same way — `-255 / levels`, `nr_frame.release_slope` — and 0, the default,
+  is off; `nr_frame_compose` / `nr_frame_update` hand it to `nr_compose_temporal`'s new `release`
+  argument when a `previous` frame is given. `nr_frame_native.Params` carries it. The struct grew
+  by one float, so a host built against the old header must be rebuilt (VBA-M's filter uses
+  `nr_frame_defaults` and the still path, so it compiles unchanged and the release stays off).
+- **`nr_compose_temporal` runs the release on `nr_image.c`'s own pool**, not OpenMP, like the
+  rest of that pass; the per-pixel `moved` is taken once for the release and the floor.
+- **Every runtime has both.** The release is host code after the graph, and the async mode is
+  the layer's socket protocol with the daemon, so neither touches libxmx, libmetalmx or
+  libd3dmx: a daemon on `NR_GPU_BACKEND=metal` or `d3d12` serves an async layer as it serves a
+  synchronous one. The layer itself is still POSIX-only, so on Windows the async mode has no
+  client yet.
+
+Verified on the M3: `test_native_image` (12 release cases against NumPy, and released pixels
+the still frame bit for bit) at the default, 1 and 3 threads; the C frame test pair on Vulkan
+and Metal with two new release checks each — within 2e-6 of NumPy's release through the C
+library, and released pixels exactly the confidence-0 frame; `test_present` and
+`test_present_negative` with `NR_BUILD_LAYER=ON` through MoltenVK, the async cases included (every
+untouched frame holds the answer to request n-1). No Xe2, phone or Windows run.
+
+Also new beside them: **`nr_frame_rates`** (`src/bench/nr_frame_rates.c`, CMake and Makefile), a C
+`live_rates.py` — the daemon's whole frame through `libnr_frame` in one process, the history, hold
+and release included, printing the same table and the `nr_knobs.RATES` literal; `--pan N` keeps the
+history alive, which fresh random frames (the default, like `live_rates.py`) never do. It needed
+**`nr_frame_head()`** in `nr_frame.h`: the network half of `nr_frame_update` — features as half in
+the mapped input, the graph, the head cropped — with no composition, so a host can run the network
+at a render scale and compose at full size.
+
+
+## the async live mode exists, and is off by default for a reason (2026-09-25, night)
+
+`NR_LAYER_ASYNC=1` (with live mode): on each processed present the layer sends this frame
+and shows the answer to the previous one, so the daemon works while the game draws. Correct
+and tested — `test_present.py` checks which answer every image holds, n synchronously and
+n-1 async, and the async expectation fails against a synchronous layer.
+
+**In Tekken 7 it did not pay.** 640x360: 29-31 fps against 25-32 synchronous; 1280x720 at
+0.3: 21-22 against 20-22 — and the graph itself **3 ms slower** (28 against 25 ms at
+320x320), because the game's rendering now runs beside it on the same iGPU. What it hides
+is CPU time, and there is little of it left; what it adds is a frame of latency, which the
+owner felt at once and more at larger scales and resolutions. His threshold: under ~15 ms
+of added latency or not at all. So it stays an option, off. It is kept for machines where
+the work around the network is a large share of the frame — the Windows run in PR #3 spent
+0.3 s of 2.3 s on the GPU — since that work is what the overlap hides.
+
+## At 30 fps a trail appeared, and a `release` knob drops it (2026-09-25, evening)
+
+In Tekken 7 with the new kernels — **640x360 25-32 fps, 1280x720 20-22, 1920x1080 10-13**,
+the owner playing — the owner saw ghosting behind everything that moved, which 10 fps had
+hidden. The cause is the model's history gate, not our hold floor: with identity
+reprojection a moving pixel's history is what used to be there, and the gate read 0.63 over
+the whole session. `release` fades the gate out where the game's own pixel changed — full
+at no change, none by 24 levels of 255 — and leaves the floor alone. 24 is the owner's
+choice from 4/8/16/24 in the game; 0 restores the old behaviour. `notes/phase54`.
+
+The knob descriptions were rewritten at the owner's request: general, no scene a user
+cannot see (a kimono, an iris). The measurements they used to quote are in the notes.
+
+**Render scale 0.9 looks better than 1.0, and it is not arithmetic.** The owner saw it in
+DoA5 at 720p (0.9 over 0.95 and 1.0) and it measures (`src/bench/scale_spectrum.py`, three
+DoA5 frames cropped to a native 1280x720, temporal off): at 1.0 the pass's change is
+**1.5-1.7x smaller** (mean |Δ luma| 0.025-0.026 against 0.039-0.043 at 0.9), and **3-4x
+more of it is pixel-level** — 3 % of the added energy above half Nyquist against 0.9 %,
+on two of the frames. At the display size the network is handed the game's raw pixels,
+jagged edges included, and turns part of them into grain; bilinear to 0.9 smooths them
+first, and the upscale of what it draws cannot make pixel-level content. That fits the
+vendor's own arrangement, where the pass runs at the render resolution and DLSS upscales
+after it. Padding is not it: the extents are 1280x768, 1216x704 and 1152x704, and 0.95,
+with the least padding, looked worse than 0.9. The render scale's text now says 0.9 for
+screenshots.
+
+## Three more dlss-nr-on-intel commits, on every runtime (2026-09-25, evening)
+
+`3e2688d`..`3a6bb27` of `uzbekunknown/dlss-nr-on-intel` are in: window attention in one
+workgroup a window, the fused feed-forward sixteen subgroups a workgroup with the narrow blocks'
+weights shared, and the notes and re-measured rates (next section). The GLSL matrix kernels are
+upstream's, unchanged. Carried past them:
+
+- **libxmx** takes upstream's dispatches (window `1` workgroup a window-head, FFN
+  `ceil(M/256)`, flag `0x800000` for 32 x 128) and three things upstream did not need. The two
+  matrix kernels now declare `GL_EXT_shared_memory_block`, so on a matrix device **without
+  `VK_KHR_workgroup_memory_explicit_layout`** (or an adopting host that did not pass
+  `XMX_ADOPT_EXPLICIT_LAYOUT`) `xmx_window_init`/`xmx_ffn_init` build the `_portable` twin
+  instead and say so on stderr — correct, not bit-identical to that path's unfused passes. Each
+  fused workgroup is checked against `maxComputeSharedMemorySize` and
+  `maxComputeWorkGroupInvocations` at init (matrix FFN 32 KB / 512 lanes, portable FFN 24 KB /
+  256, window 16 KB / 256), so a device that cannot hold one says which. And the dispatch
+  follows which kernel was built (`rwindow_twin`, `rffn_twin`).
+- **The Vulkan portable twins.** `ffn_fused_portable.comp` is eight 16-row blocks a 256-lane
+  workgroup, the staged weights in 16 KB of shared memory, 24 KB in all; every barrier is the
+  workgroup's (a phone's subgroup may be narrower than a slice), so a surplus slice idles
+  through them. **`window_attention_portable.comp` keeps its old form** — one 32-lane workgroup
+  per eight rows. The one-workgroup-a-window form was built (K transposed in shared memory, the
+  weights made in registers from the lane's own accumulators, exactly 16 KB) and was bit-exact,
+  but on MoltenVK, the only portable Vulkan device here, a 1280x768 frame took **614 ms against
+  602**; a packed-word version 660, a 128-lane one 614.
+- **Metal** (`window_attention.metal`, `ffn_fused.metal`, `libmetalmx`): both kernels 256
+  threads a threadgroup. Window attention is 16 KB on both paths — the simdgroup kernel stages
+  its logits half the keys at a time, as upstream does; **32 KB with separate logit and
+  probability tiles made it 30 % slower** (39.4 -> 51.0 ms), 24 KB 36.7, 16 KB 31.1. The fused
+  FFN is eight simdgroups at 32 KB (a `simdgroup_float8x8` has no cheap per-element access, so
+  each keeps a 2 KB stage and writes the gated hidden chunk over it from registers); a 1 KB
+  stage in 16-column halves was slower, 36.8. The portable kernels mirror the GLSL layouts,
+  window attention included, because on Metal it pays. Surplus simdgroups leave after the
+  weights' barrier; only simdgroup barriers follow. A pipeline allowing fewer than 256 threads
+  is refused at record time with the number.
+- **Direct3D 12** (`d3d12/*_portable.hlsl`, `libd3dmx`): the portable layouts, window attention
+  in the one-workgroup form (16 KB, packed words), the FFN 24 KB; the FFN dispatch
+  `ceil(M/128)` still splits at 65535 with `spare`. Compiled by dxc (both window builds) and
+  libd3dmx by MinGW-w64; **not run**.
+- **The C frame library** records these passes through `xmx_rec_window_attention` /
+  `xmx_rec_ffn` and needed no change; `test_nr_frame` and `test_dlssnr` pass against the Python
+  head on Vulkan and Metal with the new kernels.
+
+Measured on the M3, 1280x768, paired against the previous commit on the same build: **Metal
+simdgroup window attention 39.4 -> 31.1 ms, fused FFN 32.9 -> 30.7, device total 401.9 ->
+~390**; Metal portable 64.4 -> 55.5 and 70.1 -> 56.2, total 585 -> 566; **MoltenVK wall time
+622 -> 603 ms**, the gain the FFN twin's. At 320x320 on Metal the passes go 5.06 -> 4.29 and
+3.50 -> 3.31 ms. Verified: every window and FFN kernel case bit-exact on Vulkan-portable,
+Metal-simdgroup and Metal-portable, mapped and `XMX_STAGING=1`; the whole ctest suite green but
+`publish_check` (the committed `weights/*.h`, as before). No Xe2, phone or Windows run.
+
+## Window attention and the feed-forward loaded their operands once per subgroup (2026-09-25, afternoon)
+
+The owner asked for window attention — 19-21 % of the graph at every extent — to be solved.
+It ran one 32-lane subgroup to a workgroup with 2 KB of shared memory, and at 64 x 2 KB
+shared memory is the whole L1/SLM array: **no L1, so the eight workgroups of a window each
+fetched its K and V from L2, tile by tile**. The narrow blocks' fused feed-forward had the
+same shape of waste — each workgroup fetched both 8 KB weight matrices for its 16 rows,
+sixteen times its activations. Both now load once and share through shared memory, at the
+same threads a core, bit-identical: window attention at 0.48x its time, the feed-forward at
+0.6x. `notes/improve-shared-memory.md`, which also lists what was tried on the way.
+
+On the daemon's path, paired, answers byte-identical: **640x360 at 0.5 34.8 -> 30.6 ms,
+512x288 at 0.35 34.2 -> 29.7, 1280x720 at 0.35 49.1 -> 43.7, 1920x1080 at 0.3 71.6 -> 63.5,
+1920x1080 at full scale 433 -> 370**. Graph curve **8.9 ms + 162 ms per megapixel**; README
+table re-measured (medians of three).
+
+**How it was found matters more than the fix.** Instruction counts pointed the wrong way
+twice — a V load with 17 % fewer instructions was 9 % slower, and deleting 230 instructions of
+row sums changed nothing. Taking each load out in turn, with a constant in its place, found it
+in two runs. Next: the same question for every kernel that runs one subgroup to a workgroup.
+
+## Ten more dlss-nr-on-intel commits, on every runtime (2026-09-25)
+
+`7a6f338`..`5636456` of `uzbekunknown/dlss-nr-on-intel` are in: the idle-CPU lead closed, Tekken
+7 at 1280x720, scale 0.5's area mean in C, the staged kernel from K = 32, the skips as their level
+buffers, the compact head and the half input on by default, the history kept without copies, the
+re-measured rate table, and their notes (next section). Carried past libxmx and the Python:
+
+- **`nr_area_mean`, `nr_features_half` and `nr_to_half` are in `nr_image.c` on its own pool**,
+  not OpenMP, and public in `nr_image.h`. The half stores are bit patterns (`uint16_t`, through
+  `nr_float_to_half`), because MSVC has no `_Float16`; `nr_to_half` bands a buffer in 4096-element
+  runs so the pool can split it.
+- **The C frame library records the skips as the level buffers**, `l1`-`l5` read by the decoder
+  and the decoder input merge writing a new `d5`, so its `copy` passes and `skip*`/`split_skip`
+  are gone. It too defaults to **`NR_INPUT_FP16=1` and `NR_COMPACT_HEAD=1`**, and
+  `nr_frame_update` builds the features as half **directly in the mapped input**
+  (`nr_features_half`, the control-mask channels included), so no float32 feature array and no
+  conversion stand before the first GEMM. `nr_frame_run_features` with float32 features converts
+  on the pool. Unmapped input (`XMX_STAGING=1`) builds into host scratch and uploads, as before.
+- **`xmx_profile_each_kind()`** is in `xmx.h` and all three runtimes.
+- **The staging threshold is 32 on libxmx and libd3dmx, and stays 128 on libmetalmx.** Upstream
+  lowered it for the Xe2 kernel's occupancy fix; the M3's simdgroup kernel is not that kernel,
+  and paired through the C library at 1280x720 K >= 32 was the same bytes and **1.5 % slower**
+  (399-403 against 405-406 ms, three pairs). `XMX_STAGE_K=32` to try it on another Apple GPU.
+  libd3dmx has no staged kernel, so its value only keeps the two in step.
+
+Verified on the M3 against the real weights: the whole ctest suite green on Vulkan and Metal
+but `publish_check`, still failing on the committed `weights/*.h`; the C frame test pair at the
+defaults, `NR_INPUT_FP16=0`, `NR_COMPACT_HEAD=0`, both off, `XMX_STAGING=1` and
+`NR_HOST_THREADS=1` on both runtimes, with two new checks that `nr_frame_update`'s head with a
+control mask or the automatic mask is the graph's on the float32 features; `test_dlssnr` on
+both. The new defaults on Metal through the C library at 1280x720: 408-410 -> 406-408 ms, the
+same head (`ff78b88715c96a3c`). libd3dmx compiles for x86_64 Windows against the MinGW-w64
+headers, exporting `xmx_profile_each_kind`, and `nr_image.c` and `nr_frame.c` build with the NDK
+for arm64-v8a and armeabi-v7a; none of that has run.
+
+## The frame around the network, taken apart again (2026-09-25, night)
+
+Five small steps on the daemon's own path, each byte-identical and each its own commit, and
+together **640x360 at 0.5 from 39-41 ms yesterday morning to ~35 ms; 1280x720 at 0.35 from
+70-73 to ~48; 1920x1080 at 0.3 from 106-122 to ~71**. README table re-measured with them:
+
+- the staged kernel for every K from 32 (`phase22`'s 128 predated its occupancy fix);
+- the five skip connections are their level buffers — no copies, 28-60 MiB less;
+- scale 0.5's area mean in C (`nr_area_mean`);
+- **the compact head on by default** — the host reads 4 of 16 columns, 4 ms at 1280x720;
+- **the features built as half, in the mapped input itself** (`ResidentFrame.input_view`):
+  no host copy and no GPU `to_half`. Every feature is a half value already, so this cannot
+  move one — `test_native_image.py` checks that before anything else;
+- **the history holds this frame's arrays instead of copies of them** — three fresh
+  multi-megabyte arrays a frame, and their page faults, gone.
+
+Measured and not kept, in `improve-fusions.md`: the bottleneck publishing straight into
+`deep`, the fused FFN's publish from a table (2.7x slower), window attention's bias hoisted or
+paired, and `encode8` returning a view. At 640x360 the graph is now 31 of the 35 ms.
+
+## Five more dlss-nr-on-intel commits, on every runtime (2026-09-24, night)
+
+`3a79933`..`064ffad` of `uzbekunknown/dlss-nr-on-intel` are in: the staged GEMM's partial last
+64-row block, the Tekken 7 25 fps record, the temporal gate and the hold floor inside the native
+composition, the host passes on every core, and their notes. Carried past libxmx:
+
+- **The partial block on Metal**: `gemm_staged` in `metal/gemm_simd.metal` clamps a partial
+  block's A rows to the last real one and `store_staged` skips rows past M; `libmetalmx` routes
+  M that is not whole 64-row blocks to it under the same `XMX_STAGED_PARTIAL` (default 1) and
+  `xmx_staged_partial()`. **Direct3D 12** has no staged kernel, so `xmx_staged_partial()` there
+  accepts the switch and changes nothing. `test_staged_partial.py` skips on a runtime or device
+  without a staged kernel (portable Vulkan, MoltenVK, D3D12) rather than failing.
+- **The gate table in the C frame library**: `nr_frame.c` builds the 65536-entry table once per
+  blend scale (with `expf`, as its per-pixel gate did — still the one place it can differ from
+  NumPy by a last bit) and hands it to `nr_compose_temporal`'s new `table, confidence`
+  arguments, which also clip the floor to 1 as upstream now does.
+- **The threads are not OpenMP here.** Apple's clang has none, MSVC's is 2.0, and `nr_image.c`
+  is linked into libdlssnr and so into VBA-M's sandboxed `.app`. `nr_image.c` has its own pool
+  (pthreads; Win32 condition variables from Vista on; serial where neither exists): contiguous
+  bands of rows as OpenMP's static schedule gives them, passive waits, a job already running
+  sends a second caller serial. `NR_HOST_THREADS` (else `OMP_NUM_THREADS`) sets the count.
+  `nr_parallel_rows()` is public in `nr_image.h`, and `nr_frame.c` puts its own row loops on it
+  too — the detail blur, the masked composition, the noise. ctest runs `test_native_image` at
+  1 and 3 threads beside the default; the Makefile does the same.
+
+Verified on the M3 (a scratch copy with MLX-DLSS cloned and the safetensors rebuilt from
+`weights/`): `test_staged_partial` 34 cases bit-exact on Metal-simdgroup, unmapped memory too
+(skipped on MoltenVK, which is portable); the C frame pair and `test_dlssnr` 36/36 on Vulkan and
+Metal, also at `NR_HOST_THREADS=1`; `test_native_image` at 1, 3 and 8 threads; temporal controls,
+scratch arena, frame execution, input FP16, compact head and joint QKV on both runtimes. At
+1920x1080, 1 thread against 8, same bytes: temporal composition 14.0-14.3 -> 5.3-7.5 ms,
+composition 7.0-8.2 -> 2.5-3.4, encode 4.6-6.9 -> 1.5-2.4. The Win32 pool and libd3dmx compile
+with MinGW-w64, the pool and nr_frame.c with the NDK for arm64-v8a and armeabi-v7a; none of that
+has run. `publish_check` still fails on the committed `weights/*.h`, as before this change.
+
+## The dlss-nr-on-intel fusions on every runtime (2026-09-24)
+
+The 36 commits of `uzbekunknown/dlss-nr-on-intel` from 2026-09-19 to 09-24 are in this tree
+(35 rebased; the 36th is a merge with no changes of its own): the batched FFN groups, the
+compact input and output, joint QKV, the present fences, the int8 kernel and its contract,
+the residual and QKV epilogues, the window partition folded into the QKV loads, one-pass
+window attention, the fused feed-forward, the full-resolution glue, the staged GEMM's shared
+bytes, and their notes (`notes/improve-*.md`, `phase68`, `phase69`). **Every fusion now runs on
+all three runtimes and in the C frame library**, not only on libxmx's matrix path:
+
+- **Vulkan without matrix units** (MoltenVK, phones, `XMX_PORTABLE=1`): `gemm_portable.comp`
+  takes every fused flag, and `window_attention_portable.comp` / `ffn_fused_portable.comp` are
+  the fused passes summed in the portable GEMM's order. `xmxres.fused_shader` picks the twin.
+- **Metal**: `libmetalmx` and `metal/*` carry the same flags and passes on the simdgroup and
+  portable paths (`window_attention.metal`, `ffn_fused.metal`, `nr_epilogue.h`).
+- **Direct3D 12**: `libd3dmx` and `d3d12/*` carry them on its portable GEMM, with a 128-byte
+  push block and six root UAVs. Compiled with dxc and MinGW; **not run**, as before.
+- **`nr_frame.c`** records the new graph call for call, all 14 `NR_*` switches included
+  (`NR_JOINT_QKV`, `NR_INPUT_FP16`, `NR_COMPACT_HEAD` too), and stays bit-identical to the
+  Python head in every combination tried.
+
+Verified on the M3: every fusion test bit-exact on Vulkan-portable, Metal-simdgroup and
+Metal-portable, the C frame test pair on Vulkan and Metal, `XMX_STAGING=1` on the frame and
+QKV tests; the full ctest suite green but `publish_check` (scratch `.DS_Store` only). The int8
+tests skip without cooperative matrix. **No Xe2 run**: the matrix-path GLSL is upstream's.
+
+Three things not to undo. **The staged GEMM now needs `VK_KHR_workgroup_memory_explicit_layout`**
+(its tiles and stage alias): libxmx enables it when present, and an adopting host passes flag 2
+(`XMX_ADOPT_EXPLICIT_LAYOUT`) — VBA-M's wx and Qt Vulkan panels now do. Without it the staged
+kernel is not built, and **`xmx_window_gather()`** is 0 on a matrix device, so the Python and C
+record the partition as its own pass. **The glue's merge is `fma(skip, cos, scale)` with a plain
+multiply for the scale, never `precise`**: SPIRV-Cross spells a precise multiply
+`fma(l, r, 0.0)`, which turns `-0` into `+0` and broke bit-identity on MoltenVK. And **a fused
+pass must equal its own backend's reference**, so each portable twin copies the portable GEMM's
+lane layout and summation order, not the matrix kernel's.
+
+## Latest: the runtime on Direct3D 12 — libd3dmx (2026-09-22; one run, the graph did not come back)
+
+**There is a third compute runtime, Windows only, and it has run once.** The run opened the
+device, built the nine pipelines, uploaded the weights, recorded and captured the graph — and
+the graph's list had not signalled its fence after 60 s, with the device *not* removed, so the
+old fixed timeout turned what is most likely a slow adapter (16.6 s of setup where the M3 takes
+one) into an error that named nothing. The wait now has no timeout by default (one-second slices,
+device-removed checked in each, a stderr note from 10 s on; `XMX_D3D12_TIMEOUT=N` for a limit),
+`XMX_D3D12_STEP=1` runs the recording pass by pass with a name and a time on stderr, the debug
+layer's messages are drained to stderr, and a real bug went with it: `cmd_begin` reset the
+recording's resource-state tracking from the transfer list too. A second attempt then failed
+at `D3D12CreateDevice (0x887a0004)` on the first-listed adapter, where VBA-M's D3D12 panel opens
+a device: adapter selection now *probes* every hardware adapter (device + SM 6.2 + 16-bit ops)
+and falls back to WARP, as `panel.cpp` does. `notes/phase75`, "The first run". The next run is the one with `-v`, then `XMX_D3D12_STEP=1 XMX_D3D12_DEBUG=1`.
+
+`src/gpu/libd3dmx.c`
+implements every `xmx_*` entry point of `xmx.h` on Direct3D 12 in C (COM through `lpVtbl`,
+`d3d12.dll` and `dxgi.dll` loaded by name, nothing linked), and carries the kernels rewritten in
+HLSL under `src/gpu/d3d12/` — nine DXIL modules from five sources, compiled by dxc and embedded
+through bin2c, serving the fourteen names every caller uses. **`NR_GPU_BACKEND=d3d12`** makes
+`nr_build.library("xmx")` and `nr_frame.c` load it; CMake builds it under `NR_BUILD_D3D12` (on by
+default for every Windows target but 32-bit x86, when dxc is found) and `NR_DLSSNR_D3D12`, which
+follows it, builds libdlssnr from it — a Windows x64 or ARM64 host gets the Direct3D 12 archive
+unless it passes `-DNR_DLSSNR_D3D12=OFF` — with `nr_frame_adopt_d3d12` for a host that wants to
+share its device (VBA-M's filter skips its Vulkan share when `nr_frame_runtime()` is not
+`vulkan`, and says so in `Device()`). Verified on the M3: the nine
+modules compile without a warning, the disassembly carries the `precise` marks and the
+round-to-even the E4M3 quantiser needs, the DLL cross-compiles with MinGW exporting all 49
+entry points, and the CMake cross build makes the DLL, the archive and its test. **No kernel
+has been seen to finish on a Direct3D 12 device**; `notes/phase75` says how to make the next run
+(`-v` for the adapter's name, `XMX_D3D12_STEP=1 XMX_D3D12_DEBUG=1` for the pass list and the
+validation messages, and `XMX_D3D12_WARP=1` for the software adapter).
+
+Five things a next reader must not undo. **There is no matrix path**: HLSL has no shipped
+matrix-matrix operation (the SM 6.8 WaveMatrix preview was withdrawn, SM 6.9's `linalg` is
+matrix-vector), so every GEMM is the multiply-add kernel and `gemm_resident` / `gemm_tiled` /
+`gemm_coopmat` / `gemm_batched` / `gemm_staged` resolve to it (`kernel_alias`). **An operand is a
+root UAV plus a byte offset in the push block's address slot**, because HLSL cannot dereference
+a pointer; the GLSL's alignment tests on the address hold on the offset since a resource is 64 KB
+aligned. **A dispatch is split at 65535 groups per axis** and the kernels add the push block's
+`spare` word to their group id — the graph's wide passes exceed the limit by 2x, and Vulkan
+never enforced one. **Narrow stores go through `f32tof16`**, so a half buffer holds exactly what
+`half_round` gives, independent of a driver's `fptrunc`. And **specialization does not exist
+there**: the flags come from the push block and `xmx_specialized_count()` is 0. Also: a dxc
+without `dxil.dll` beside it (every Linux and macOS dxc) writes unsigned DXIL, which the runtime
+takes only with developer mode on; libd3dmx asks for the experimental shader models when it
+finds its modules unsigned and says so in the pipeline error.
+
+## Latest: the runtime on Metal — libmetalmx (2026-09-21, later)
+
+**There is a second compute runtime, Apple only.** `src/gpu/libmetalmx.m` implements every
+`xmx_*` entry point of `xmx.h` on Metal directly — no MoltenVK, no SPIRV-Cross — and carries
+the fourteen kernels rewritten in the Metal Shading Language (`src/gpu/metal/`), compiled by
+Apple's `metal` into one `nr_shaders.metallib` that bin2c puts inside the library.
+**`NR_GPU_BACKEND=metal`** makes `nr_build.library("xmx")` and `nr_frame.c` load
+`libmetalmx` instead of `libxmx`; nothing else changes, the shader names included
+(`gemm_coopmat.spv` selects the kernel `gemm_coopmat`). Built by `make` under Darwin and by
+CMake under `NR_BUILD_METAL` (on by default on Apple, a hard error anywhere else); `make
+test-metal` and the `metal_*` ctests run the GPU suite on it. The matrix path is
+`simdgroup_matrix` with half operands into a float accumulator — the GEMM contract is
+**exact** on it, every epilogue and slice at max |d| 0 — and a real 720p frame through the C
+library takes **735-746 ms against 938-948 ms through MoltenVK** on the same M3, the two
+outputs at correlation 0.99987 (mean 0.28 levels, max 5). `notes/phase74`.
+
+Four things the next reader must not undo, three of them learned the hard way in one session:
+the buffer addresses in the push block come from an **`MTLArgumentEncoder`** over one pointer
+argument, not from `[MTLBuffer gpuAddress]` — that property is macOS 13, VBA-M's deployment
+target is 11.0 and warned on it, and the encoder writes the identical value on every buffer
+of both storage modes (400 checked); the Metal compiler runs with **`-fno-fast-math -ffp-contract=off`** (the `phase67` FMA trap,
+now at the compiler rather than in MoltenVK's config); consecutive encoders are ordered by an
+**`MTLFence`**, because the graph's buffers are untracked and without it the skip copies ran
+before the blocks that fed them — every block bit-exact, the whole graph at correlation 0.25;
+and the GEMM epilogue goes **through threadgroup memory, never over `thread_elements()`**,
+which is a 64-wide vector per thread and cost 27x when looped over. **`libdlssnr` on Apple
+is now built from libmetalmx** — no Vulkan symbol in the archive, `-framework Metal` its
+public link interface, `test_dlssnr` bit-identical to the Python path — so a host there
+must not call `nr_frame_adopt_vulkan` (refused: nothing Vulkan to adopt) and can ask
+`nr_frame_runtime()` which runtime it has; `-DNR_BUILD_METAL=OFF` gives the Vulkan archive.
+The Vulkan layer is unchanged and serves a MoltenVK game from either runtime through the
+daemon, untested here. Also fixed: `test_softmax_pack.py` lacked `import sys` and failed on every
+backend.
+
+## Latest: it builds for Android (2026-09-21)
+
+The CMake build goes through the Android NDK — `-DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake
+-DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=28` standalone, or inside VBA-M's
+`tools/android/build-android-qt.sh`, which already passes `ENABLE_VULKAN=ON` and now links
+`libdlssnr.a` into the Qt APK. `find_package(Vulkan)` finds the NDK's `libvulkan.so` by itself;
+`bin2c` and `slice` are built for the build machine (VBA-M's `host_compile()`, or this tree's
+own `NR_HOST_CC` fallback, which refuses the cross toolchain's directory); the weights compile
+under the same two-job pool. Built and linked for arm64-v8a and armeabi-v7a; `notes/phase72`. **It has now run on one device**, a
+Mali-G57 MC2 phone, after one fix: the row pass fenced its shared-memory staging with a
+subgroup-scope barrier that Mali's compiler aborts on (and that would fence only half of a
+32-wide workgroup on a 16-lane subgroup); it is a `barrier()` now, all 34 C checks pass on
+the phone, at 6.7 s a pass. `notes/phase73`.
+
+Three things a next reader needs. **The layer defaults off on Android** and its X11 define is
+now `__linux__ && !__ANDROID__` — Android is `__linux__` with no `X11/Xlib.h`, which was the
+one compile failure. **VBA-M's Release build hands `-ffast-math` to every target here**, and
+has since the archive was added: the exact flags come later on the line and win — verified on
+the NDK's clang 21, no `fmadd` and no reassociation — so it is a warning, now silenced, not a
+numerics change. And **a phone takes the portable GEMM path** with no cooperative matrix, on a
+subgroup width nobody has measured (Adreno 64, Mali 16, against the 32 of Xe2 and Apple); the
+device must be Vulkan 1.3 with `shaderFloat16`, `storageBuffer16BitAccess`,
+`bufferDeviceAddress`, the memory model and `scalarBlockLayout`, or `xmx_open` fails and the
+filter drops to none. `nr_temp_dir()` now knows `/data/local/tmp`.
+
+## The weights compiled into libnr_frame (2026-09-20, later)
+
+The CMake build now embeds `dlssnr-logical.safetensors` — found in the source root or
+`work/mlxw/`, or named with `-DNR_WEIGHTS_FILE=` — into `libnr_frame` through **bin2c**
+(`src/tools/bin2c.c`, Rafael Kitover's, unchanged), and `nr_frame_open(NULL)` reads the
+safetensors from the compiled-in bytes. The `nr_frame` command without `--weights`,
+`test_nr_frame`, and `NativeFrame()` with no argument all default to that. **Same head bytes
+as the file** (`bb94971d4937ef64` on a 512x288 random frame, both ways), 34 C checks green,
+the library 294 MB.
+
+**The trap is the compiler, not the file.** A byte-array initializer costs clang ~90 bytes of
+memory per byte: 1.44 GB for a 16 MB slice, ~25 GB for the whole file on an 8 GB machine. So
+`src/tools/slice.c` cuts the file into 8 MB pieces, bin2c writes one header per piece,
+each is its own translation unit under a two-job Ninja pool (`NR_EMBED_CHUNK_MB`,
+`NR_EMBED_JOBS`), and the whole build is 60 s at 0.89 GB peak. Do not "simplify" it back to
+one array. The generated C lives in `build/weights/` and `*.safetensors` is ignored, so
+nothing derived from the DLL is committed. The Makefile embeds nothing and its library
+refuses a NULL path with a message. The Python graph still reads the file. `notes/phase71`.
+
+**The fifteen SPIR-V modules are compiled in too**, into libxmx and gemm_runner, by the same
+bin2c (`NR_EMBED_SHADERS`, on). A shader is now *named*: `xmx_init("gemm_coopmat.spv")` takes
+the embedded module, a path still opens a file (the `XMX_*_SPV` overrides), and a path whose
+file is missing falls back to the embedded one. `nr_frame.c` and `nr_build.shader_arg()`
+hand over bare names when the runtime has them. Verified with every `.spv` moved out of
+`build/`: the C test, the Python GEMM test and the frame all run, same bytes. The files are
+still written for the benches. The build's tool targets are `bin2c_dlss` / `slice_dlss`
+because VBA-M adds this tree as a subdirectory beside its own `bin2c`.
+
+## The CMake build lands in its own directory (2026-09-20)
+
+`cmake -S . -B build && cmake --build build` now puts every library, executable, `.spv` and the
+ICD manifest in **`build/`** — flat, the Makefile's names — and leaves `work/` to the inputs:
+the weights and the headers clone. What made that possible is **`src/nr_build.py`**, the one
+place the Python now asks where a build put things: `NR_BUILD_DIR` in the environment first
+(every ctest gets it; `make test` pins `work/`), else the newest of `work/` and `build*/` by
+`libxmx`'s mtime. Sixteen files spelled `ROOT / "work"` before; none of the *output* users do
+now. The C command finds the weights from `build/` too (`../work/mlxw`). `-DNR_OUTPUT_DIR=work`
+gives the old layout. **The one trap: two builds, no `NR_BUILD_DIR`, and the newest wins** —
+`python3 src/nr_build.py` prints which one that is. Verified on the M3: a full CMake build into
+`build/` with `work/` untouched, and the ctest subset named in the note. `notes/phase70`.
+
+**The embedded weights come from `weights/`, not from bin2c at build time.** The directory holds
+the logical safetensors as C — 35 bin2c slices of 8 MB and their table — and `NR_EMBED_WEIGHTS`
+(ON) compiles it into `libnr_frame`. `NR_BIN2C_WEIGHTS` (**OFF**) regenerates the directory
+first from `dlssnr-logical.safetensors` when the file is found, and says so and skips when it
+is not. Regeneration was checked byte-identical to the checked-in slices and table. The `.bin`
+and `.c.in` intermediates now go to the build tree; the copies left in `weights/` from the
+earlier scheme are dead weight (280 MB) and can go. `notes/phase70`.
+
+## CMake for three platforms, and half precision without `_Float16` (2026-09-19, late)
+
+`CMakeLists.txt` builds what the Makefile builds, into the same `work/` with the same names,
+on Linux and macOS as run here and on Windows as written — MSVC or clang-cl with the Vulkan
+SDK, libpng from vcpkg, the layer off because it is POSIX. `ctest` runs the suite. **The Windows build
+now links** — a MinGW-w64 cross-compile from the M3 (`buildmingw-x64/`, ignored by git along with
+every `build*/`) produces every DLL, exe and shader into `work/`; **nobody has run those
+binaries yet** (no Wine here, no Windows machine). Three things stood in the way and are fixed:
+`-march=native` handed to a cross-compiler (CMake now probes for it), a `dlfcn.h` include and a
+second `clock_gettime` in the command, and a Windows `BIND` in the library that never compiled.
+`src/ref/nr_portable.h` holds the platform seams — `nr_dl_open`, `nr_dl_sym`, `nr_dl_self_dir`,
+`nr_now` — and both C files now go through them instead of carrying their own `#ifdef _WIN32`
+copies; its software half conversion for MSVC is **exhaustively bit-exact** against `_Float16`
+over all 2^32 floats and all 65 536 halves, NaN payloads aside. One MSVC trap stays: the
+`sprintf_s` blocks abort on truncation where `snprintf` clips, and MinGW never takes them.
+`notes/phase69`.
+
+## The frame path is a C library, and a real frame rendered on the M3 (2026-09-19, night)
+
+`src/ref/nr_frame.c` is `nr_frame.py` in C — the safetensors reader, the 71-block graph
+recorded against libxmx **call for call** as `nr_frame_resident.py` and `nr_resident.py`
+record it, the features and the composition on `nr_image.c` — built as
+`work/libnr_frame.so`, with `work/nr_frame` — the `nr_frame.py` command itself in C, every
+flag, PNG through libpng and no ImageMagick — and `nr_frame_native.py` to
+drive the library from NumPy. **The head is bit-identical to
+the Python resident path** on the same features, checked on the real weights by
+`test_nr_frame_c.py` (20 checks, in `make test`). Where C and NumPy part it is by a last
+bit of a transcendental — five noise values in 307 200, the blur kernel's `expf`, the
+gate's — and the note says so. Reproduce the picture with the features held fixed, not
+with the noise regenerated on each side. `notes/phase68`.
+
+**The weights are on the Mac now** (`work/mlxw/`, extracted by the owner during the
+session), so every test that skipped runs there, and a **real 1280x720 frame renders on
+Apple silicon: 0.90 s** through the C library, 888 ms of it the graph on the portable GEMM.
+The `phase67` estimate held.
+
+**`make test` fails at `publish_check`, and the code is not why.** Two commits made on the
+Mac outside the session dropped `/work/` and `/ref/` from `.gitignore` and committed 205
+files under `work/` — the MLX-DLSS clone, manifests, six test binaries, a log. No weights,
+no DLL. The check reads `git ls-files`, so it now fails on the binaries and will fail on
+every build. Restore the ignore and `git rm -r --cached work`, or exempt the build
+directory; the owner decides.
+
+## It builds and passes on an Apple M3 through MoltenVK (2026-09-19, evening)
+
+MoltenVK has **no `VK_KHR_cooperative_matrix`**, and SPIRV-Cross cannot translate the matrix
+opcodes at all, so every GEMM here failed to load on the owner's Mac. Now the runtime asks
+the device: with the extension it runs the kernels it always ran; without it every GEMM
+goes to `src/gpu/gemm_portable.comp` — the same push constants, flags, strides, batch,
+epilogues and store, computed with plain FP32 multiply-adds — behind the same dispatches.
+`XMX_PORTABLE=1` forces that path on Xe2, and `make test` runs `test_portable.py` both ways.
+The staged 64x32 kernel has no portable twin and is never selected without matrix units.
+
+On the M3: **`make test` green, 117 checks**, five skips for the absent weights; the
+portable kernel does **480-570 GFLOP/s** against the matrix kernel's 1348-3828 on Xe2. **No
+frame was rendered** — no DLL on that machine — so the graph on Apple silicon is a claim
+nobody has made yet. Estimate from the kernel rate: about a second a 720p frame.
+
+**Two things a next reader must not undo.** `xmx.py` sets `MVK_CONFIG_FAST_MATH_ENABLED=0`
+before the library loads: Metal's fast math contracts the gate's multiply and add into an
+FMA and skips the half rounding between them, which moved the gate epilogue 3e-03 and every
+E4M3 publish a quantum, and a frame rendered that way would look right and match nothing.
+And on macOS `libxmx.dylib` — every library there carries `.dylib`, the Makefile, the loaders and the layer manifest agreeing — links **MoltenVK directly** while the layer and its tests link the
+**loader** — the two are both called libvulkan on that machine and only one knows what a
+layer is. `notes/phase67`.
+## Latest: over a third of the frame was passes that need not exist (2026-09-23)
+## Latest: 46 % of the frame was passes, shared memory and pads (2026-09-24)
+## Latest: 48 % of the frame was passes, shared memory and pads (2026-09-24)
+## The host passes on every core, and a lead in the CPU's idle state (2026-09-24, evening)
+
+**The passes around the network, at the output's resolution, are cheaper.** The temporal gate
+runs natively after all — its logit is half, so a 65536-entry table of NumPy's own sigmoid is
+exact (`phase57`) — and every native pass is split by rows across the eight cores (upstream
+with OpenMP; this tree with `nr_image.c`'s own pool, see the top of this file), which cannot
+change a byte (tested at 1, 3 and 8 threads). The log's change figure is taken on
+every fourth row: over the whole frame it was 5 ms of a 1080p frame. On the daemon's own path,
+answers byte-identical: **1280x720 at 0.35, 70-73 -> 60-61 ms with the gate and -> 53 with the
+cores; 1920x1080 at 0.3, 106-122 -> 77-82 with the cores**; 512x288 and 640x360 unchanged,
+because there the graph is 33 ms of 36-39. README table
+re-measured: 1024x768 at 0.55 84 -> 75 ms, 1920x1080 at 0.55 196 -> 171.
+
+**Scale 0.5's area mean is in C too.** At exactly half, `resample` took NumPy's five strided
+passes — a copy, three adds, a divide — 1.5 ms of a 640x360 frame, and again inside the history
+take. One pass now, the same adds in the same order, byte-identical (`test_native_image.py`, and
+`test_daemon.py`'s check against `mean((1, 3))`): **640x360 at 0.5, 39.3-41.0 -> 36.5-38.1 ms;
+1280x720 at 0.5, 79-84 -> 73.** In the game at 1280x720 and scale 0.35 the threaded passes
+measured +18 % (`phase59`).
+
+**The staged kernel now takes every K from 32 up.** The threshold of 128 was `phase22`'s,
+measured when that kernel ran on half its threads and waited on its loads one at a time; since
+those fixes it wins at every depth it takes: **1 ms of the 320x320 graph (32.2 -> 31.2), 4 ms
+at 1280x720**, same bytes. Only the stem, K = 16, stays tiled. And the five skip connections
+are their level buffers now — the decoder writes `d1`-`d5`, so nothing had to be copied: the
+same bytes, 28-60 MiB less device memory. `frame_profile.py --calls` labels each GEMM with the
+kernel that ran it.
+
+**Deferred: an asynchronous live mode.** Overlapping the game, the layer and the daemon's CPU
+work with the graph, estimated from measured stages: **+7 % at 640x360, +18 % at 1280x720**,
+for one more frame of latency. The history is why it is so little: frame N+1's features need
+frame N's composed output, so only the decode, the downscale, the encode and the socket can
+move off the critical path. The owner deferred it until nothing else is left to take.
+
+**A lead, tested and closed.** Before a reboot, with zram in heavy use, the 320x320 graph ran
+**32.1-32.7 ms with every core idle and 27.3 with any process spinning on a P-core** — a bare
+`pause` loop did it — at the same 1950 MHz GPU clock. After a fresh boot the same spinner bought
+**5 %** (32.4 -> 30.7 ms), and a 50 us PM QoS latency limit (`/dev/cpu_dma_latency`, held by the
+owner as root) bought **nothing**: 32.3 ms idle, and it damped the spinner's gain to 0.7 ms. So
+it is not the package's deep C-states, it moves with the machine's state, and a core spinning for
+every graph is not worth 5 %. Nothing kept; the uncore frequency (0400 here) was never read.
+*Re-measured 2026-09-25, afternoon, and closed for the daemon:* a spinning thread took the bare
+graph loop from 31 to 26.5 ms again — on a P-core or an LP E-core alike, wherever the waiting
+thread sat — but only when it spun all along; spinning just for the length of each graph bought
+nothing. And on the daemon's own path it bought nothing at all, because the host passes' OpenMP
+threads cancel it: with `OMP_NUM_THREADS=1` the spinner's 4.5 ms came back, with two or more
+threads — on other P-cores or on the LP E-cores — it was gone. A game's own threads will do the
+same. It is also why `upsample merge` measured three times its stand-alone time inside a frame.
+Tried and not kept, in `improve-fusions.md`: weights stored as their E4M3 bytes
+(exact, but a proxy put the prize at 0.14 ms a frame) and, again, register prefetch.
+
+## The staged GEMM was on half its threads (2026-09-24, later)
+
+The owner asked why window attention has exactly 2 KB of shared memory and what 1 KB or
+512 B would do. Two separate answers, and only the second cost anything here.
+
+**A driver quirk.** Mesa sizes a core's shared-memory partition as *workgroups its threads
+hold* x **the declared bytes**, but gives each workgroup its declaration **rounded up** — 1 KB
+at least, then powers of two to 16 KB. So declaring less can be slower: 256 B puts a 32-lane
+kernel on a quarter of the threads, 512 B on half, 1.25-1.5 KB is 29 % slower than 2 KB.
+Verified in the source (26.2.2, `genX_shader.c:1183`; unchanged in 26.2.3 and `main`), in
+the driver's own decoded dispatches (`INTEL_DEBUG=bat`: the preferred partition is the only
+field that differs between a 256 B and a 1 KB pipeline) and at fourteen sizes on the
+hardware. **It costs this frame nothing measurable** — the base GEMM at 512 B, the one kernel
+it touches, is no faster padded to 1 KB.
+
+**The cap.** 128 KB between a core's workgroups, on any driver. `gemm_staged.comp` is 128
+lanes and declared 15.5 KB: eight workgroups a core, half the threads. **Declare exactly an
+allocation size, and keep (workgroups a core holds) x size <= 128 KB.**
+`notes/improve-shared-memory.md`. Its operand tiles and its stage
+are never live at once, so they now alias as two `shared` blocks
+(`VK_KHR_workgroup_memory_explicit_layout`, enabled in libxmx): 8 KB, sixteen workgroups.
+**Staged GEMM 90.5 -> 70.9 ms at 720p, device total 219 -> 198**, bit-identical, `make test`
+green in both memory modes. The one new barrier is load-bearing — without it all three head
+hashes change.
+
+Curve **9 ms + 205 ms per megapixel**. Live, re-measured with it and with scale 0.5's area
+mean out of NumPy's multi-axis reduction (16.5 -> 1.9 ms at 1024x768): 512x288 at 0.35 is
+**42.7 ms**, 1920x1080 at 0.55 **205.5**. At 512x288 every scale up to 0.62 runs the same
+320x320 network, and 0.62 measured 42-43 ms against 41-42 at 0.35 — three times the real
+pixels for a millisecond.
+
+Measured and not kept: the softmax pipeline at 1 KB (0.4 ms), the base GEMM padded to 1 KB
+(nothing), the fused FFN aliased to 1 KB to win the L1 back (1 %, noise). The L1 is real —
+it and shared memory are one array, and at 2 KB x 64 the partition is all of it — but none
+of these kernels lives on it.
+
+**And the staged GEMM's loader was waiting on its own loads.** At the live extent the deep
+GEMMs are neither short of blocks (a 64x16 build doubled them: no change) nor of K steps
+(BK = 64: slower): each load sat in its own branch and was waited for before the next. Issuing
+the step's loads together takes the bottleneck's 64x1024x4096 from 0.27 to 0.22 ms and a frame
+1 ms faster at 320x320, 3 ms at 720p, bit-identical. `notes/improve-fusions.md`.
+
+**And the staged kernel now takes a partial last block**, so the deeper levels' GEMMs over 144
+or 400 rows leave the tiled kernel, which ran them at half the speed. Bit-identical
+(`XMX_STAGED_PARTIAL=0` to compare), and it pays where a level is not whole 64-row blocks:
+**live 512x288 at 0.35 42.7 -> 36.7 ms (27 fps)**, the 320x320 graph 36.5 -> 32.7, 1920x1088
+444.6 -> 422.6, and nothing at 1280x768, whose levels all are. Curve **9.4 ms + 196 ms per
+megapixel**; the README table is re-measured with it.
+
+**In a game it is 25 fps.** Tekken 7, live, every present through the network, the owner
+playing: **25 fps at 640x360** at scale 0.35, 0.5 and 0.6 alike (a 320x320 or 384x320 network,
+40 ms a frame, 30-33 ms of it the graph), and 800x450 at 0.35 the same — 10.5 fps on
+2026-09-16. `notes/phase59`.
+
+**The fix is built and tested, not filed.** Mesa 26.2.3 rebuilt with the one line
+(`work/mesa-26.2.3/`, loaded through `VK_DRIVER_FILES`, system driver untouched): every size
+up to 2 KB at the full rate, this project unchanged and green, and one cost measured — a
+256 B pointer chase loses the L1 the small partition had left it, 2.33 -> 3.62 ms. The
+issue draft and the standalone reproducer (`src/probe/slm_occupancy.*`) are ready; filing
+needs the owner's account.
+
+## 48 % of the frame was passes, shared memory and pads (2026-09-24)
+
+A second day of the same kind of work, driven by a new profile per call site —
+`python3 src/bench/frame_profile.py --calls N`, each pass labelled by the entry point that
+recorded it and its shape. Every change bit-identical, checked on kernel tests, three whole
+frames (one a real game frame) and both memory modes:
+
+- **window attention in exactly 2 KB of shared memory**: 56 -> 46 ms at 1280x768. Padded to
+  8 KB the same shader ran 76 % slower — occupancy is its bound;
+- **block 70 stores half for the head directly**, one `to_half` fewer;
+- **the full-resolution glue** (`NR_FUSE_GLUE`): block 70's input in one pass instead of
+  four, the stem's GEMM storing its own half copy; 8 ms at 720p. The residual pass compiles
+  to FMA — measured on crafted inputs — so the merged pass writes `fma()` explicitly;
+- **the narrow blocks' whole feed-forward in one kernel** (`NR_FUSE_FFN`, `ffn_fused.comp`):
+  the 128-wide hidden layer never leaves the chip; 33.6 -> 21.7 ms of GPU time at 720p;
+- **the bottleneck padded to 64-row blocks** when it costs under an eighth more rows, putting
+  its K=4096 GEMMs on the staged kernel: 240.6 -> 235.4 ms at 720p;
+- the branched blocks' published FFN output stored as half (1.3 ms);
+- **the window partition folded into the QKV projection** (`NR_FUSE_PARTITION`): the staged
+  GEMM's A loader gathers the window rows from the image itself, zero outside it, rounding to
+  half on the way in — 62 passes fewer, 8.7 ms at 720p;
+- **still frames composed natively**: `nr_frame.compose` only reached the C `nr_compose`
+  above intensity 1 or with history, so photo mode and every cut paid 3.9 ms of NumPy at
+  512x288 for the same bytes.
+
+All eight switches off against on, paired: **1280x720 445 -> 231 ms, 1920x1080 968 -> 507,
+320x320 62 -> 41.** Graph curve **10 ms + 230 ms per megapixel**. Live: 512x288 at 0.35 is
+**45.1 ms (22.2 fps)**, and every live size up to 640x360 runs the network at 320x320, where
+the graph is ~39 ms of the round trip.
+
+Measured and **not** kept, so nobody tries them again:
+
+- 16-column chunks in the fused FFN: no spills at all, and 9 % slower than 32 columns with
+  some. The spill count is a symptom to read, not a target;
+- the same kernel for the branched blocks (`NR_FUSE_BRANCHED_FFN`, off): −2.7 ms at 720p,
+  +2.6 at 384x384. The deeper levels are arithmetic, where the staged GEMM does better;
+- register-prefetch pipelining in the staged GEMM: 30 % slower (84 -> 111 ms of staged GEMM
+  at 720p), as phases 21 and 26 found for the K loop before;
+- the tiled or base kernel for the small-M, deep-K GEMMs of the deep levels at 320x320: both
+  slower than staged (43 -> 53 ms for the frame).
+
+What is left at the live extent (320x320): GEMMs of the deep levels with M of 64-576 and K up
+to 4096, latency-bound on 32-200 workgroups; split-K would parallelise them and is ruled out
+because it changes the order of summation.
+
+## Over a third of the frame was passes that need not exist (2026-09-23)
+
+**"Performance inside the graph is finished" was wrong.** Every pass that only moves data is
+at the memory ceiling — `phase45` measured that correctly — but a pass at the ceiling that
+need not exist is all waste, and a per-pass profile never asks whether a pass should be
+there. Five fusions, each bit-identical and each behind its own switch:
+
+- the residual in the projection's epilogue, twice, and attention in one pass (Codex's
+  phases 38, 39 and 42, ported: `notes/improve-fusions.md`);
+- the head merge in the fused attention's store (`NR_FUSE_ATTENTION_MERGE`, 4 %);
+- **Q and K normalised and V published in the QKV projection's own epilogue**
+  (`NR_QKV_EPILOGUE`, 22 %): the float32 projection — 377 MB at block 0 of a 720p frame,
+  written once and read three times — no longer exists. `notes/improve-qkv-epilogue.md`.
+
+All five off against on, paired in one process on a freshly booted machine: **1280x720
+458 -> 284 ms, 1920x1080 980 -> 600, 384x384 80 -> 52**, dispatches 1128 -> 592. The extent
+curve is now **10 ms + 274 ms per megapixel**; live, 512x288 at scale 0.35 is 53.9 ms,
+18.6 fps, and 1920x1080 at 0.55 is 280 ms. README table and `nr_knobs.RATES` re-measured
+with it.
+
+Four things to carry:
+
+- **Measure with empty swap.** Before a reboot, with 5.5 GiB in zram, 1920x1080 live ran
+  322-463 ms from run to run; after it, 278-283. The small extents barely moved. Check
+  `swapon --show` and `/proc/pressure/memory` first; `phase51` was bitten by the same thing.
+
+- **Workgroup shared memory comes in powers of two.** A 64-byte array beside a `stage`
+  of exactly 2 KB took every tiled GEMM's workgroup to 4 KB and cost 23 ms of a 720p frame —
+  in every tiled GEMM, used or not, with the compiled code identical to the instruction.
+  Found only by profiling with the new feature *off*. Check the total before adding any.
+- **A fusion moves a write into an earlier dispatch, so it has to re-check the scratch
+  arena.** `k16` shares a role with the QKV projection's own input; the epilogue writes K
+  while other workgroups still read that input, so K goes to `key16` in that mode. The role
+  table was built for passes that finish before the next starts.
+- **`ffn_batch.py`'s host-read column is not to be trusted between modes.** Twice it showed
+  the "on" mode reading the head up to 2x slower; twice a direct probe found 7.49 against
+  7.45 ms. The graph time is the measurement.
+
+Left: window attention (57 ms at 1280x768) is now the largest pass that is not a GEMM;
+`partition` (17) and `to_half` (10) could be second outputs of the epilogues before them; the
+QKV epilogue's reduction runs on half the lanes.
+
+## The present has a test, and `NR_LAYER_SYNC=semaphore` (2026-09-19, later)
+
+> **Superseded 2026-09-22** (`d22ed9d`): there is one path now. The layer waits on the
+> present's own semaphores, finishes its copies on private fences and never drains a queue;
+> `NR_LAYER_SYNC` is accepted and ignored. `notes/improve-present-fences.md`; the stand that
+> found the old default reading unfinished images is `phase69`.
 
 The layer's two `vkQueueWaitIdle` calls per present are now optional. `NR_LAYER_SYNC=semaphore`
 waits on the semaphores the present brought, signals one of a ring of four, and redirects the
@@ -49,11 +1103,10 @@ because on a card the outer two are PCIe and one total cannot tell them apart; a
 weights moved above the frames, so changing the render scale no longer re-uploads 292 MB
 (first frame at a second extent: 335 ms -> 78). `notes/phase65`.
 
-**Still `vkQueueWaitIdle` twice a frame in the layer.** `nr_layer.c:527` has said for weeks
-that the proper route is the present's own semaphores and that it "has to change before the
-pass runs every frame". It runs every frame. On this iGPU the network hides it; on a fast
-card it stalls the game's whole pipeline, and a game that presents from a queue other than
-the one it renders on can hand us an unfinished image.
+~~**Still `vkQueueWaitIdle` twice a frame in the layer.**~~ **Gone since 2026-09-22**
+(`d22ed9d`, `notes/improve-present-fences.md`): no queue is drained; the layer waits on the
+present's semaphores and on its own fences. The cross-queue case this paragraph feared was
+real — `phase69` caught the old default copying an unfinished image.
 
 ## Somebody else ran it, on a discrete GPU (2026-09-18)
 
@@ -140,10 +1193,11 @@ because the graph is 185 ms of it and untouched. `notes/phase57`.
 
 Three things worth carrying forward:
 
-- **The gate and the floor's constant stay in NumPy.** `expf` and NumPy's float32
-  exponential disagree in the last bit, and `clip(1 - moved * 255 / ramp, 0, 1) * hold` is
+- **The floor's constant stays in NumPy**: `clip(1 - moved * 255 / ramp, 0, 1) * hold` is
   the same value as `moved * slope + hold` by algebra and a different one in float32. The
-  contract is byte-identical, not nearly.
+  contract is byte-identical, not nearly. *The gate stayed there too, for `expf`, until
+  2026-09-24: its logit is half, so a 65536-entry table of NumPy's own sigmoid runs it in C
+  bit-exactly (`phase57`).*
 - **`active_region` then became the largest host pass** — 21 ms, reducing the whole frame
   twice to find bars that never move. `Letterbox` finds them once and afterwards checks
   eight lines. 0.2 ms.
@@ -436,7 +1490,8 @@ value:
    than 8 % just to reach parity.
 
 **Memory is no longer the constraint it was**: the shared scratch arena took 720p from
-5041 to 2303 MiB and 1080p now fits without swapping (phase 32).
+5041 to 2303 MiB and 1080p now fits without swapping (phase 32) — and 701 MiB since the
+scratch is sized by what the recording touches (2026-09-26).
 
 **Real time is still not on the table.** At `17 ms + 488 ms/Mpixel`, 30 fps needs about
 a 243x137 extent and 15 fps about 425x239. On this hardware with this graph, DLSS-NR is
@@ -561,6 +1616,11 @@ followed from the wrong gate form), the leading-region projection, and "1.01x pa
 - **External write-ups are summaries, not sources.** A WebFetch of `weight_spec.json`
   returned plausible-looking shapes with a confabulated label (`block31` as "final
   output stage"). Clone the repo and read the file.
+- **A reset to the remote drops whatever was never pushed.** On 2026-09-23 `master` was
+  reset to `origin/master`, and three commits kept on purpose the day before went with it;
+  `test_present.c` cited two notes that no longer existed until they were restored on
+  09-24. Before resetting a branch to its remote, `git log origin/<branch>..<branch>` — and
+  leave a backup ref.
 
 ---
 
@@ -632,20 +1692,26 @@ What is *not* claimed:
 - **No NVIDIA parity gate.** There is still no NVIDIA GPU here, so there are still no
   reference activations. The graph is MLX-DLSS's recovery from vendor captures, and it
   is validated against their spec and against behaviour, not against the DLL.
-- **The whole graph is resident on the GPU**: phase27 warm medians are **0.114 s** at
-  384x384, **0.536–0.550 s** at 720p and **1.179 s** at 1080p. The optimization is
+- **The whole graph is resident on the GPU**: phase27 warm medians were **0.114 s** at
+  384x384, **0.536–0.550 s** at 720p and **1.179 s** at 1080p; since the fusions and the
+  shared-memory fix (2026-09-24) 1280x720 is about **0.2 s** of GPU time, on the curve
+  `9.4 ms + 196 ms per megapixel`. The optimization is
   bit-identical to the generic GPU path. Earlier comparisons reported head correlation
   0.9918 with the CPU reference and visually indistinguishable pictures.
-  **2.3 GiB** of device buffers at 720p since the scratch arena (`phase32`); the 5.6 GB
-  this used to say predates it, and 1080p did not fit at all before.
+  **0.7 GiB** of device buffers at 720p and 1.2 at 1920x1088, weights included, since the
+  scratch is sized by what the recording touches (2026-09-26); 2.3 GiB with the arena
+  alone (`phase32`), and the 5.6 GB this used to say predates both — 1080p did not fit
+  at all before.
   `src/gpu/nr_frame_resident.py`, `notes/phase15-residency.md`,
   `notes/phase18-fusion.md`, `notes/phase21-fusion-and-tiling.md`.
 - **It runs in a real game, in two modes.** A Vulkan layer captures the presented frame,
   a daemon runs the model, and the result goes back into the swapchain. Proven in **Dead
   or Alive 5** (32-bit D3D9 through DXVK) with faces enhanced and measured, and the layer
   proven to attach under **VKD3D-Proton** on a 64-bit D3D12 title. Photo mode is triggered
-  by a file; live mode (`NR_LAYER_LIVE=N`) runs continuously and reaches 10.6 fps at
-  512x288. `src/layer/`, `notes/phase34-doa5.md`, `phase41`, `phase47`.
+  by a file; live mode (`NR_LAYER_LIVE=N`) runs continuously: 26-27 ms a frame at 512x288
+  and 640x360 for the daemon alone (37-39 fps, `nr_knobs.RATES`, 2026-09-26). In a game it shares the GPU
+  with the game's own rendering — Tekken 7 ran 25 fps at 640x360 on 2026-09-24, against 10.5 on 2026-09-16, before the
+  fusions (`phase59`). `src/layer/`, `notes/phase34-doa5.md`, `phase41`, `phase47`.
 - **HDR is handled**: `src/ref/nr_display.py`, the recovered display codec — encode a
   linear-HDR frame to an sRGB proxy with a soft knee, run the model, fold it back by
   luminance ratio onto the untouched original. Clamping instead destroys 97 % of the
@@ -665,12 +1731,12 @@ What is *not* claimed:
   do not establish the optimized kernel's ceiling. Earlier notes quoted 23 GB/s,
   which was single-threaded numpy and wrong by 3x. Both GEMM and elementwise graph
   operations now run on the GPU.
-- **Temporal processing exists** in `nr_temporal.py`; both game modes use the
-  single-frame path and supply no engine motion or history. Feature channels 7:10 *are*
-  the history slot and the still path fills them with the current colour. Live mode has a
-  previous output but no motion vectors, and `phase12` measured the gate at **0.032 with
-  wrong motion** — un-reprojected history would be rejected, so it is not worth wiring
-  blind. `notes/phase48`.
+- **Temporal processing runs in live mode** since `phase54`: the previous output goes into
+  feature channels 7-9 with identity reprojection — a present-time layer has no motion
+  vectors, and identity is bit-exact — under the model's learned gate and a hold floor
+  where the game handed back the same pixel: 3.7x less flicker. Photo mode stays
+  single-frame, and `nr_temporal.py` keeps the motion-vector path for sequences that have
+  real motion. `notes/phase53`, `phase54`.
 - The graph recovery is **not ours**. Ours is the Xe2 execution path, the numpy
   reference, the independent second extraction that confirms their weight spec, and
   the PTX findings in section 2 that their write-up and ours agree on.
