@@ -27,6 +27,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#pragma warning (disable : 4456)
+#endif
+
 static int failures, checks;
 
 static void check(const char *name, int ok, const char *detail)
