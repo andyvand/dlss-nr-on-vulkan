@@ -551,7 +551,10 @@ int main(int argc, char **argv)
      * encoded, against the upscale, nr_frame_compose and nr_encode8 one after the other */
     {
         int hh = height * 3 / 5, hw = width * 3 / 5, fw = width + 10;
-        float *head = malloc((size_t)hh * hw * 4 * sizeof(float)), *up = malloc(pixels * 4 * sizeof(float));
+        if (head) {
+            free(head);
+        }
+        head = malloc((size_t)hh * hw * 4 * sizeof(float)), *up = malloc(pixels * 4 * sizeof(float));
         float *middle = malloc((size_t)height * hw * 4 * sizeof(float));
         float *fused = malloc(pixels * 3 * sizeof(float)), *want = malloc(pixels * 3 * sizeof(float));
         for (size_t i = 0; i < (size_t)hh * hw * 4; i++) head[i] = normal();
