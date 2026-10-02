@@ -36,6 +36,23 @@ const char *xmx_device(void);
 const char *xmx_path(void);
 const char *xmx_memory(void);
 int xmx_staging_mode(void);
+/* 1 on a card with memory of its own (the operands live there and the host reaches them by
+ * copies), 0 on a shared-memory device. */
+int xmx_discrete(void);
+/* Whether the GEMMs keep float16 subnormals: libxmx declares `DenormPreserve 16` on every
+ * SPIR-V module where the driver reports `shaderDenormPreserveFloat16` (Mesa flushes them by
+ * default, Intel's Windows driver keeps them, and with the mode declared the two compute one
+ * graph bit for bit, notes/phase71; `XMX_DENORM16=driver` leaves it to the driver). Metal
+ * and Direct3D 12 have no mode to declare: libmetalmx and libd3dmx answer what their half
+ * arithmetic does, which `test_denorm.py` checks on each. */
+int xmx_preserve16(void);
+/* Which spelling of `half_round` the pipelines compile: 1 is the cast, `float(float16_t(x))`,
+ * 0 the pack-and-unpack round trip. Chosen per driver by libxmx (publish.glsl, constant 1;
+ * `XMX_HALF_ROUND=pack|cast` overrides): Mesa folds the cast, Intel's Windows compiler folds
+ * the round trip, and whichever is folded every vendor rounding point vanishes. libmetalmx
+ * has one spelling, the cast; libd3dmx one, `f16tof32(f32tof16(x))`. The daemon's start-up
+ * probe checks the one in use. */
+int xmx_half_by_cast(void);
 size_t xmx_embedded_shader(const char *name);
 
 /* the plain GEMM path */
@@ -152,6 +169,21 @@ int xmx_graph_run(int id);
 int xmx_graph_destroy(int id);
 
 /* profiling */
+/* Abandon a pipeline build in progress.
+ *
+ * Opening the model compiles every pipeline, which a driver can take tens of seconds over,
+ * and a caller that has decided it no longer wants the model -- a renderer about to destroy
+ * the device it lent, say -- would otherwise have to wait the whole of it out. Set from any
+ * thread: the build checks it before each pipeline, so the wait becomes one pipeline rather
+ * than all of them, and fails with "cancelled". Clear it before opening again.
+ *
+ * A build that ends this way leaves nothing open; `xmx_close` is not needed and the next
+ * `xmx_init` starts over. */
+void xmx_cancel(int on);
+/* Whether the flag is set. A caller distinguishes its own cancellation from a real failure
+ * with this rather than by matching the message. */
+int xmx_cancelled(void);
+
 int xmx_profile(int on);
 void xmx_profile_reset(void);
 double xmx_profile_ms(unsigned kind);
