@@ -159,6 +159,8 @@ static struct {
 	int pin32;                /* pipelines require 32-lane subgroups (build_pipeline_spec) */
 	int half_by_cast;         /* half_round's spelling, constant 1 on every pipeline (xmx_init) */
 	int preserve16;           /* float16 subnormals kept: DenormPreserve 16 on every module (xmx_init) */
+	int preserve64;           /* DenormPreserve 64 goes with it, which 32_BIT_ONLY requires (xmx_init) */
+	int rte16, rte64;         /* RoundingModeRTE likewise: AMD truncates float16 undeclared (xmx_init) */
 	/* XMX_PIPELINE_STATS=FILE: what the driver's compiler made of each pipeline, appended to
 	 * FILE through VK_KHR_pipeline_executable_properties, where the device has it */
 	FILE *stats;
@@ -469,45 +471,74 @@ static volatile int g_cancel;
 void xmx_cancel(int on) { g_cancel = on ? 1 : 0; }
 int xmx_cancelled(void) { return g_cancel; }
 
-/* `words` with DenormPreserve declared for 16-bit floats on every entry point, or NULL when
- * there is nothing to add: a module that already declares a 16-bit denorm mode keeps its own
- * (src/bench/denorm_mode.py's copies do), and SPIR-V before 1.4 would need
- * SPV_KHR_float_controls, which this does not add. The caller frees the result. */
-static uint32_t *declare_preserve16(const uint32_t *words, size_t n, size_t *out_n)
+/* One float-controls execution mode to declare: the mode itself, the capability it needs,
+ * and the opposite mode, whose presence in a module means it has already chosen. */
+struct float_mode { uint32_t mode, cap, opposite; };
+
+/* `words` with each mode in `modes` declared on every entry point for each width in `widths`,
+ * or NULL when there is nothing to add. A mode the module already settles for one of those
+ * widths -- either way round -- is left to it (src/bench/denorm_mode.py's copies do that), and
+ * SPIR-V before 1.4 would need SPV_KHR_float_controls, which this does not add. The caller
+ * frees the result.
+ *
+ * `widths` is 16 alone where the driver reports that width independent, and 16 and 64 together
+ * under VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY, which requires one mode across
+ * every width other than 32 and would make a 16-only module invalid
+ * (VUID-RuntimeSpirv-denormBehaviorIndependence-06289, and -06291 for the rounding mode).
+ * Declaring 64 needs no Float64 capability, since no 64-bit type appears; it is the execution
+ * mode's literal operand. */
+static uint32_t *declare_float_controls(const uint32_t *words, size_t n, size_t *out_n,
+					const uint32_t *widths, size_t n_widths,
+					const struct float_mode *modes, size_t n_modes)
 {
-	enum { CAPABILITY = 17, ENTRY_POINT = 15, EXECUTION_MODE = 16, EXECUTION_MODE_ID = 331,
-	       DENORM_PRESERVE = 4459, DENORM_FLUSH = 4460, CAP_DENORM_PRESERVE = 4464 };
+	enum { CAPABILITY = 17, ENTRY_POINT = 15, EXECUTION_MODE = 16, EXECUTION_MODE_ID = 331 };
 	if (n < 5 || words[0] != 0x07230203u || words[1] < 0x00010400u) return NULL;
+	if (n_modes > 4) return NULL;
+	int wanted[4], has_cap[4];
+	for (size_t k = 0; k < n_modes; k++) { wanted[k] = 1; has_cap[k] = 0; }
 	size_t cap_end = 0, mode_end = 0, entries = 0;
-	int has_cap = 0;
 	for (size_t i = 5; i < n;) {
 		uint32_t count = words[i] >> 16, op = words[i] & 0xffffu;
 		if (count == 0 || i + count > n) return NULL;
 		if (op == CAPABILITY) {
 			cap_end = i + count;
-			if (count > 1 && words[i + 1] == CAP_DENORM_PRESERVE) has_cap = 1;
+			for (size_t k = 0; k < n_modes; k++)
+				if (count > 1 && words[i + 1] == modes[k].cap) has_cap[k] = 1;
 		}
 		if (op == ENTRY_POINT) entries++;
 		if (op == ENTRY_POINT || op == EXECUTION_MODE || op == EXECUTION_MODE_ID) mode_end = i + count;
-		if (op == EXECUTION_MODE && count >= 4 && words[i + 3] == 16
-		    && (words[i + 2] == DENORM_PRESERVE || words[i + 2] == DENORM_FLUSH))
-			return NULL;
+		if (op == EXECUTION_MODE && count >= 4)
+			for (size_t k = 0; k < n_modes; k++)
+				if (words[i + 2] == modes[k].mode || words[i + 2] == modes[k].opposite)
+					for (size_t w = 0; w < n_widths; w++)
+						if (words[i + 3] == widths[w]) wanted[k] = 0;
 		i += count;
 	}
 	if (!cap_end || !mode_end || !entries || cap_end > mode_end) return NULL;
-	size_t m = n + (has_cap ? 0 : 2) + 4 * entries;
+	size_t n_add = 0, n_caps = 0;
+	for (size_t k = 0; k < n_modes; k++)
+		if (wanted[k]) { n_add++; if (!has_cap[k]) n_caps++; }
+	if (!n_add) return NULL;
+	size_t m = n + 2 * n_caps + 4 * entries * n_widths * n_add;
 	uint32_t *out = malloc(m * sizeof *out);
 	if (!out) return NULL;
 	size_t o = 0;
 	memcpy(out, words, cap_end * sizeof *out); o = cap_end;
-	if (!has_cap) { out[o++] = (2u << 16) | CAPABILITY; out[o++] = CAP_DENORM_PRESERVE; }
+	for (size_t k = 0; k < n_modes; k++)
+		if (wanted[k] && !has_cap[k]) {
+			out[o++] = (2u << 16) | CAPABILITY; out[o++] = modes[k].cap;
+		}
 	memcpy(out + o, words + cap_end, (mode_end - cap_end) * sizeof *out); o += mode_end - cap_end;
 	for (size_t i = 5; i < n;) {
 		uint32_t count = words[i] >> 16;
-		if ((words[i] & 0xffffu) == ENTRY_POINT) {
-			out[o++] = (4u << 16) | EXECUTION_MODE; out[o++] = words[i + 2];
-			out[o++] = DENORM_PRESERVE; out[o++] = 16;
-		}
+		if ((words[i] & 0xffffu) == ENTRY_POINT)
+			for (size_t k = 0; k < n_modes; k++)
+				if (wanted[k])
+					for (size_t w = 0; w < n_widths; w++) {
+						out[o++] = (4u << 16) | EXECUTION_MODE;
+						out[o++] = words[i + 2];
+						out[o++] = modes[k].mode; out[o++] = widths[w];
+					}
 		i += count;
 	}
 	memcpy(out + o, words + mode_end, (n - mode_end) * sizeof *out); o += n - mode_end;
@@ -550,7 +581,23 @@ static int build_pipeline_spec(const char *spv_path, VkPipelineLayout layout, Vk
 	 * them, and with the mode declared the two compute the same graph bit for bit
 	 * (notes/phase71). The built shaders are not touched; the copy given to the driver is. */
 	size_t patched_n = 0;
-	uint32_t *patched = g.preserve16 ? declare_preserve16(code, len / 4, &patched_n) : NULL;
+	enum { DENORM_PRESERVE = 4459, DENORM_FLUSH = 4460, CAP_DENORM_PRESERVE = 4464,
+	       ROUND_RTE = 4462, ROUND_RTZ = 4463, CAP_ROUND_RTE = 4467 };
+	const uint32_t widths[2] = { 16, 64 };
+	struct float_mode modes[2];
+	size_t n_modes = 0, n_widths = 1;
+	if (g.preserve16) {
+		modes[n_modes++] = (struct float_mode){ DENORM_PRESERVE, CAP_DENORM_PRESERVE,
+							DENORM_FLUSH };
+		if (g.preserve64) n_widths = 2;
+	}
+	if (g.rte16) {
+		modes[n_modes++] = (struct float_mode){ ROUND_RTE, CAP_ROUND_RTE, ROUND_RTZ };
+		if (g.rte64) n_widths = 2;
+	}
+	uint32_t *patched = n_modes
+		? declare_float_controls(code, len / 4, &patched_n, widths, n_widths,
+					 modes, n_modes) : NULL;
 	VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 					 .codeSize = patched ? patched_n * 4 : len,
 					 .pCode = patched ? patched : code };
@@ -888,7 +935,22 @@ static void detect_driver_modes(VkPhysicalDevice pd, uint32_t api_version)
 		VkPhysicalDeviceProperties2 query = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver };
 		vkGetPhysicalDeviceProperties2(pd, &query);
-		g.half_by_cast = driver.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+		/* Which spelling of half_round survives the compiler and rounds like numpy's
+		 * float16. Mesa folds the cast away and keeps packHalf2x16's round trip;
+		 * Intel's Windows compiler folds the round trip and keeps the cast.
+		 *
+		 * AMD keeps both, but its packHalf2x16 truncates towards zero and no
+		 * declaration reaches it: the float-controls rounding mode governs the
+		 * conversion instructions, while packHalf2x16 is a GLSL.std.450 instruction
+		 * whose rounding is the implementation's. The cast is a conversion, so
+		 * `RoundingModeRTE 16` above does reach it. Measured with
+		 * src/bench/half_probe.py on a Radeon iGPU: undeclared, both spellings miss
+		 * numpy on 183147 of 360704 values; with the mode declared the cast matches
+		 * exactly and the round trip still misses the same 183147. Taking the round
+		 * trip there biases every rounding point in the graph low. */
+		g.half_by_cast = driver.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
+			|| driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY
+			|| driver.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE;
 		g.moltenvk = driver.driverID == VK_DRIVER_ID_MOLTENVK;
 	}
 	const char *half = getenv("XMX_HALF_ROUND");
@@ -899,26 +961,77 @@ static void detect_driver_modes(VkPhysicalDevice pd, uint32_t api_version)
 			     half, g.half_by_cast ? "cast" : "pack");
 	}
 	g.preserve16 = 0;
+	g.preserve64 = 0;
+	g.rte16 = 0;
+	g.rte64 = 0;
 	if (api_version >= VK_API_VERSION_1_2) {
 		VkPhysicalDeviceFloatControlsProperties controls = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES };
 		VkPhysicalDeviceProperties2 query = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &controls };
 		vkGetPhysicalDeviceProperties2(pd, &query);
-		/* Only the 16-bit mode is declared, which a driver must allow to differ from the
-		 * other widths' (VUID-RuntimeSpirv-denormBehaviorIndependence-06289 and -06290).
-		 * ANV and Intel's Windows driver both report ALL; MoltenVK reports NONE. */
-		g.preserve16 = controls.shaderDenormPreserveFloat16 == VK_TRUE
-			&& controls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+		/* What a module may declare follows denormBehaviorIndependence
+		 * (VUID-RuntimeSpirv-denormBehaviorIndependence-06289 and -06290):
+		 *
+		 *   ALL          every width is its own; declare 16 alone. ANV and Intel's
+		 *                Windows driver report this.
+		 *   32_BIT_ONLY  32 is its own and the rest share one mode, so 16 obliges 64 to
+		 *                match. AMD's proprietary driver reports this, with preserve
+		 *                available on both widths; declare the pair.
+		 *   NONE         one mode for every width, so 16 would drag 32 in with it. That
+		 *                changes the float32 arithmetic for the sake of the halves, so
+		 *                leave the driver to it. MoltenVK reports this.
+		 *
+		 * Declaring 64 costs an execution mode per entry point and nothing else: no
+		 * 64-bit type appears in these modules, so no Float64 capability comes with it. */
+		const int ind = (int)controls.denormBehaviorIndependence;
+		if (controls.shaderDenormPreserveFloat16 == VK_TRUE) {
+			if (ind == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL)
+				g.preserve16 = 1;
+			else if (ind == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY
+				 && controls.shaderDenormPreserveFloat64 == VK_TRUE)
+				g.preserve16 = g.preserve64 = 1;
+		}
 	}
+	if (api_version >= VK_API_VERSION_1_2) {
+		VkPhysicalDeviceFloatControlsProperties controls = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES };
+		VkPhysicalDeviceProperties2 query = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &controls };
+		vkGetPhysicalDeviceProperties2(pd, &query);
+		/* The same three cases as the denorm mode above, for the rounding mode. Left
+		 * undeclared this is the driver's own: Mesa and Intel's Windows driver round
+		 * float16 to nearest even, and AMD's proprietary driver truncates towards zero,
+		 * so every rounding point in the graph comes out biased low there
+		 * (src/bench/half_probe.py: both hardware spellings of half_round miss numpy's
+		 * float16 on half the values, the hand-written one does not). The graph is
+		 * written for round-to-nearest-even, which is what numpy and the vendor do. */
+		const int ind = (int)controls.roundingModeIndependence;
+		if (controls.shaderRoundingModeRTEFloat16 == VK_TRUE) {
+			if (ind == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL)
+				g.rte16 = 1;
+			else if (ind == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY
+				 && controls.shaderRoundingModeRTEFloat64 == VK_TRUE)
+				g.rte16 = g.rte64 = 1;
+		}
+	}
+	const char *round = getenv("XMX_ROUND16");
+	if (round && !strcmp(round, "driver")) g.rte16 = g.rte64 = 0;
+	else if (round && *round && strcmp(round, "rte"))
+		fprintf(stderr, "libxmx: XMX_ROUND16=%s is neither rte nor driver; keeping %s\n",
+			round, g.rte16 ? "rte" : "driver");
+	if (!g.rte16 && !(round && !strcmp(round, "driver")))
+		fprintf(stderr, "libxmx: %s cannot be told to round float16 to nearest even; its own "
+			"default decides, and a driver that truncates biases the graph low\n", g.name);
 	const char *denorm = getenv("XMX_DENORM16");
-	if (denorm && !strcmp(denorm, "driver")) g.preserve16 = 0;
+	if (denorm && !strcmp(denorm, "driver")) g.preserve16 = g.preserve64 = 0;
 	else if (denorm && *denorm && strcmp(denorm, "preserve"))
 		fprintf(stderr, "libxmx: XMX_DENORM16=%s is neither preserve nor driver; keeping %s\n",
 			denorm, g.preserve16 ? "preserve" : "driver");
 	if (!g.preserve16 && !(denorm && !strcmp(denorm, "driver")))
-		fprintf(stderr, "libxmx: %s cannot keep float16 subnormals by declaration; its own default "
-			"decides, and the picture may differ from other drivers'\n", g.name);
+		fprintf(stderr, "libxmx: %s reports one denorm mode for every float width, so float16 "
+			"subnormals cannot be declared kept without also changing float32; "
+			"its own default decides, and the picture may differ from other drivers'\n", g.name);
 }
 
 static int open_adopted(void)
