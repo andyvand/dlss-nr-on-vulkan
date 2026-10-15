@@ -1276,11 +1276,14 @@ foreach(candidate "${PROJECT_SOURCE_DIR}/dlssnr-logical.safetensors" "${NR_WORK_
     set(nr_prepare_source --weights "${candidate}")
   endif()
 endforeach()
-add_custom_target(prepare_weights
-  COMMAND "${CMAKE_COMMAND}" -E make_directory "${NR_WORK_DIR}/mlxw"
-  COMMAND $<TARGET_FILE:nr_frame_cli> --prepare "${NR_PREPARED_FILE}" ${nr_prepare_source}
-  DEPENDS nr_frame_cli
-  COMMENT "nr_frame --prepare ${NR_PREPARED_FILE} ${nr_prepare_source}" VERBATIM)
+
+if(PNG_FOUND)
+  add_custom_target(prepare_weights
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${NR_WORK_DIR}/mlxw"
+    COMMAND $<TARGET_FILE:nr_frame_cli> --prepare "${NR_PREPARED_FILE}" ${nr_prepare_source}
+    DEPENDS nr_frame_cli
+    COMMENT "nr_frame --prepare ${NR_PREPARED_FILE} ${nr_prepare_source}" VERBATIM)
+endif()
 
 add_executable(test_nr_frame src/ref/test_nr_frame.c)
 target_include_directories(test_nr_frame PRIVATE src/ref)
